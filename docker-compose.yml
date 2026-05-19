@@ -1,0 +1,17 @@
+# Infrastructure dependencies for Infraforge.
+#
+# Phase 1: nothing here is required yet — the broker runs standalone.
+# Phase 2+: the broker and worker use this Redis as the job queue and the
+#           shared state store.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: infraforge-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
