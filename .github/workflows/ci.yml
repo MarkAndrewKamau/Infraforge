@@ -1,0 +1,21 @@
+name: ci
+
+# A cheap tripwire: every push/PR must vet, build, and pass tests. As the
+# project grows phase by phase this catches a later phase silently breaking
+# an earlier one. No deploy step — the only "environment" is your laptop.
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Use whatever the module declares so CI and local never drift.
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./... -race
