@@ -41,6 +41,11 @@ func main() {
 		Queue:     q,
 		Provision: provisioner.NewShell(log),
 		Log:       log,
+		// Reclaim and retry tunables. Zero values fall back to the
+		// worker package defaults; the env vars exist mostly so crash
+		// recovery can be exercised on a short clock during testing.
+		ReclaimEvery:   envDur("WORKER_RECLAIM_EVERY", 0, log),
+		ReclaimMinIdle: envDur("WORKER_RECLAIM_MIN_IDLE", 0, log),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -53,6 +58,23 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envDur parses a duration env var (e.g. "15s", "2m"). An unset var or an
+// unparseable value yields def, so a typo degrades to the default rather
+// than crashing the worker.
+func envDur(k string, def time.Duration, log *slog.Logger) time.Duration {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Warn("invalid duration env var, using default",
+			"key", k, "value", v, "default", def)
+		return def
+	}
+	return d
 }
 
 func hostname() string {
