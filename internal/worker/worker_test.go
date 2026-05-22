@@ -15,8 +15,11 @@ import (
 
 type fakeQueue struct{ acked []string }
 
-func (f *fakeQueue) Enqueue(context.Context, string) error { return nil }
+func (f *fakeQueue) Enqueue(context.Context, string, queue.Action) error { return nil }
 func (f *fakeQueue) Dequeue(context.Context, string, time.Duration) (*queue.Message, error) {
+	return nil, nil
+}
+func (f *fakeQueue) Reclaim(context.Context, string, time.Duration, int) ([]*queue.Message, error) {
 	return nil, nil
 }
 func (f *fakeQueue) Ack(_ context.Context, m *queue.Message) error {
@@ -25,26 +28,33 @@ func (f *fakeQueue) Ack(_ context.Context, m *queue.Message) error {
 }
 
 type fakeProv struct {
-	conn *model.ConnectionInfo
-	err  error
-	// records the job ids we were asked to provision
-	seen []string
+	conn          *model.ConnectionInfo
+	provErr       error
+	deprovErr     error
+	provisioned   []string
+	deprovisioned []string
 }
 
 func (f *fakeProv) Provision(_ context.Context, j *model.Job) (*model.ConnectionInfo, error) {
-	f.seen = append(f.seen, j.ID)
-	return f.conn, f.err
+	f.provisioned = append(f.provisioned, j.ID)
+	return f.conn, f.provErr
+}
+func (f *fakeProv) Deprovision(_ context.Context, j *model.Job) error {
+	f.deprovisioned = append(f.deprovisioned, j.ID)
+	return f.deprovErr
 }
 
 func newTestWorker(prov *fakeProv, q *fakeQueue) (*Worker, store.Store) {
 	st := store.NewMem()
-	return &Worker{
-		Name:      "test",
-		Store:     st,
-		Queue:     q,
-		Provision: prov,
-		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}, st
+	w := &Worker{
+		Name:        "test",
+		Store:       st,
+		Queue:       q,
+		Provision:   prov,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxAttempts: 3,
+	}
+	return w, st
 }
 
 func seed(t *testing.T, st store.Store, j *model.Job) {
@@ -54,13 +64,20 @@ func seed(t *testing.T, st store.Store, j *model.Job) {
 	}
 }
 
-func TestHandleSuccess(t *testing.T) {
+func provMsg(jobID string) *queue.Message {
+	return &queue.Message{ID: "s-" + jobID, JobID: jobID, Action: queue.ActionProvision}
+}
+func deprovMsg(jobID string) *queue.Message {
+	return &queue.Message{ID: "s-" + jobID, JobID: jobID, Action: queue.ActionDeprovision}
+}
+
+func TestHandleProvisionSuccess(t *testing.T) {
 	q := &fakeQueue{}
-	conn := &model.ConnectionInfo{Host: "127.0.0.1", Port: 54321, Username: "u", Password: "p", Database: "d"}
+	conn := &model.ConnectionInfo{Host: "127.0.0.1", Port: 54321, Database: "d"}
 	w, st := newTestWorker(&fakeProv{conn: conn}, q)
 	seed(t, st, &model.Job{ID: "j1", ServiceName: "checkout", Status: model.StatusPending})
 
-	w.handle(context.Background(), &queue.Message{ID: "s1", JobID: "j1"})
+	w.handle(context.Background(), provMsg("j1"))
 
 	got, err := st.Get(context.Background(), "j1")
 	if err != nil {
@@ -70,19 +87,22 @@ func TestHandleSuccess(t *testing.T) {
 		t.Errorf("status = %s, want ready", got.Status)
 	}
 	if got.Connection == nil || got.Connection.Port != 54321 {
-		t.Errorf("connection = %+v, want port 54321", got.Connection)
+		t.Errorf("connection = %+v", got.Connection)
 	}
-	if len(q.acked) != 1 || q.acked[0] != "s1" {
-		t.Errorf("acked = %v, want [s1]", q.acked)
+	if got.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", got.Attempts)
+	}
+	if len(q.acked) != 1 {
+		t.Errorf("acked = %v, want one", q.acked)
 	}
 }
 
-func TestHandleProvisionerFailureMarksFailed(t *testing.T) {
+func TestHandleProvisionFailureMarksFailed(t *testing.T) {
 	q := &fakeQueue{}
-	w, st := newTestWorker(&fakeProv{err: errors.New("docker exploded")}, q)
+	w, st := newTestWorker(&fakeProv{provErr: errors.New("docker exploded")}, q)
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusPending})
 
-	w.handle(context.Background(), &queue.Message{ID: "s1", JobID: "j1"})
+	w.handle(context.Background(), provMsg("j1"))
 
 	got, _ := st.Get(context.Background(), "j1")
 	if got.Status != model.StatusFailed {
@@ -92,35 +112,103 @@ func TestHandleProvisionerFailureMarksFailed(t *testing.T) {
 		t.Errorf("want detail set on failure")
 	}
 	if len(q.acked) != 1 {
-		t.Errorf("expected ack even on failure, got %v", q.acked)
+		t.Errorf("expected ack on failure")
 	}
 }
 
-func TestHandleMissingJobAcksAndDrops(t *testing.T) {
+func TestHandleProvisionMissingJobAcks(t *testing.T) {
 	q := &fakeQueue{}
 	prov := &fakeProv{}
 	w, _ := newTestWorker(prov, q)
-	w.handle(context.Background(), &queue.Message{ID: "s1", JobID: "ghost"})
+
+	w.handle(context.Background(), provMsg("ghost"))
+
 	if len(q.acked) != 1 {
-		t.Errorf("expected ack for missing job, got %v", q.acked)
+		t.Errorf("expected ack for missing job")
 	}
-	if len(prov.seen) != 0 {
-		t.Errorf("provisioner should not have been called for missing job")
+	if len(prov.provisioned) != 0 {
+		t.Errorf("provisioner should not run for a missing job")
 	}
 }
 
-func TestHandleAlreadyReadyIsIdempotent(t *testing.T) {
+func TestHandleProvisionAlreadyReadyIsIdempotent(t *testing.T) {
 	q := &fakeQueue{}
 	prov := &fakeProv{}
 	w, st := newTestWorker(prov, q)
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusReady})
 
-	w.handle(context.Background(), &queue.Message{ID: "s1", JobID: "j1"})
+	w.handle(context.Background(), provMsg("j1"))
 
-	if len(prov.seen) != 0 {
-		t.Errorf("provisioner should not run again for ready job, got %v", prov.seen)
+	if len(prov.provisioned) != 0 {
+		t.Errorf("provisioner should not re-run for a ready job")
 	}
 	if len(q.acked) != 1 {
 		t.Errorf("expected ack for redelivered ready job")
+	}
+}
+
+func TestHandleProvisionAbandonsAfterMaxAttempts(t *testing.T) {
+	q := &fakeQueue{}
+	prov := &fakeProv{conn: &model.ConnectionInfo{}}
+	w, st := newTestWorker(prov, q)
+	// The job has already been attempted MaxAttempts times: it crashed
+	// the worker each time and kept getting reclaimed.
+	seed(t, st, &model.Job{ID: "j1", Status: model.StatusProvisioning, Attempts: 3})
+
+	w.handle(context.Background(), provMsg("j1"))
+
+	got, _ := st.Get(context.Background(), "j1")
+	if got.Status != model.StatusFailed {
+		t.Errorf("status = %s, want failed", got.Status)
+	}
+	if len(prov.provisioned) != 0 {
+		t.Errorf("provisioner should not run past the attempt cap")
+	}
+	if len(q.acked) != 1 {
+		t.Errorf("expected ack when abandoning a poison job")
+	}
+}
+
+func TestHandleDeprovisionSuccess(t *testing.T) {
+	q := &fakeQueue{}
+	prov := &fakeProv{}
+	w, st := newTestWorker(prov, q)
+	seed(t, st, &model.Job{ID: "j1", Status: model.StatusDeleting,
+		Connection: &model.ConnectionInfo{Port: 1}})
+
+	w.handle(context.Background(), deprovMsg("j1"))
+
+	got, _ := st.Get(context.Background(), "j1")
+	if got.Status != model.StatusDeleted {
+		t.Errorf("status = %s, want deleted", got.Status)
+	}
+	if got.Connection != nil {
+		t.Errorf("connection should be cleared on deprovision")
+	}
+	if len(prov.deprovisioned) != 1 {
+		t.Errorf("deprovisioner should have run once, ran %d", len(prov.deprovisioned))
+	}
+	if len(q.acked) != 1 {
+		t.Errorf("expected ack")
+	}
+}
+
+func TestHandleDeprovisionFailureKeepsDeleting(t *testing.T) {
+	q := &fakeQueue{}
+	prov := &fakeProv{deprovErr: errors.New("rm failed")}
+	w, st := newTestWorker(prov, q)
+	seed(t, st, &model.Job{ID: "j1", Status: model.StatusDeleting})
+
+	w.handle(context.Background(), deprovMsg("j1"))
+
+	got, _ := st.Get(context.Background(), "j1")
+	if got.Status != model.StatusDeleting {
+		t.Errorf("status = %s, want deleting (unchanged)", got.Status)
+	}
+	if got.Detail == "" {
+		t.Errorf("want failure detail recorded")
+	}
+	if len(q.acked) != 1 {
+		t.Errorf("expected ack to avoid an endless retry loop")
 	}
 }
