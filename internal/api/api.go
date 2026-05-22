@@ -13,6 +13,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/MarkAndrewKamau/infraforge/internal/model"
@@ -34,8 +35,10 @@ func NewServer(st store.Store, q queue.Queue, log *slog.Logger) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /v1/provision", s.handleList)
 	mux.HandleFunc("POST /v1/provision", s.handleProvision)
 	mux.HandleFunc("GET /v1/provision/{id}", s.handleStatus)
+	mux.HandleFunc("DELETE /v1/provision/{id}", s.handleDeprovision)
 	return mux
 }
 
@@ -83,7 +86,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	// Hand the job to the worker via the queue. If this fails the job is
 	// orphaned (no worker will ever see it), so mark it failed and tell
 	// the caller — never return 202 for work nothing will pick up.
-	if err := s.queue.Enqueue(ctx, job.ID); err != nil {
+	if err := s.queue.Enqueue(ctx, job.ID, queue.ActionProvision); err != nil {
 		s.log.Error("enqueue failed", "id", job.ID, "err", err)
 		job.Status = model.StatusFailed
 		job.Detail = "could not enqueue provisioning job"
@@ -112,6 +115,67 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// handleList is the inventory endpoint: "what exists right now?". It
+// returns every job the store knows about, including terminal ones
+// (failed, deleted), oldest first.
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	jobs, err := s.store.List(r.Context())
+	if err != nil {
+		s.log.Error("store list failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not list jobs")
+		return
+	}
+	sort.Slice(jobs, func(i, j int) bool {
+		return jobs[i].CreatedAt.Before(jobs[j].CreatedAt)
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(jobs), "jobs": jobs})
+}
+
+// handleDeprovision begins teardown of a job's resources. Like provision,
+// it is asynchronous: it marks the job "deleting", enqueues a deprovision
+// work item, and returns 202. The worker performs the actual removal.
+func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id := r.PathValue("id")
+	job, err := s.store.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "no job with id "+id)
+		return
+	}
+	if err != nil {
+		s.log.Error("store get failed", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not read job")
+		return
+	}
+
+	// Idempotent: a DELETE on an already-terminal teardown is not an
+	// error, it just reports the current state.
+	switch job.Status {
+	case model.StatusDeleted:
+		writeJSON(w, http.StatusOK, job)
+		return
+	case model.StatusDeleting:
+		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
+
+	job.Status = model.StatusDeleting
+	job.Detail = ""
+	job.UpdatedAt = time.Now().UTC()
+	if err := s.store.Put(ctx, job); err != nil {
+		s.log.Error("store put failed", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not record job")
+		return
+	}
+	if err := s.queue.Enqueue(ctx, job.ID, queue.ActionDeprovision); err != nil {
+		s.log.Error("enqueue deprovision failed", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not enqueue deprovision")
+		return
+	}
+	s.log.Info("deprovision requested", "id", id, "service", job.ServiceName)
+	writeJSON(w, http.StatusAccepted, job)
 }
 
 // newID is a short random hex ID — enough for a local learning system.
