@@ -22,6 +22,9 @@ type Store interface {
 	Put(ctx context.Context, j *model.Job) error
 	// Get returns the job, or ErrNotFound.
 	Get(ctx context.Context, id string) (*model.Job, error)
+	// List returns every job currently recorded, in no particular order.
+	// It is the control plane's inventory: the answer to "what exists?".
+	List(ctx context.Context) ([]*model.Job, error)
 }
 
 // MemStore is a concurrency-safe in-memory Store.
@@ -49,4 +52,14 @@ func (s *MemStore) Get(_ context.Context, id string) (*model.Job, error) {
 		return nil, ErrNotFound
 	}
 	return j, nil
+}
+
+func (s *MemStore) List(_ context.Context) ([]*model.Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*model.Job, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		out = append(out, j)
+	}
+	return out, nil
 }
