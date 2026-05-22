@@ -54,43 +54,72 @@ package and not the others.
 
 ## Architecture
 
+The happy path runs down the spine; every failure mode branches off it.
+Numbered steps are the calls made between components.
+
 ```
-                client
-                  |
-                  | (1) POST /v1/provision
-                  v
-          +-----------------+
-          |     broker      |   Go HTTP service. Validates the request,
-          |  (cmd/broker)   |   persists the job, enqueues a reference.
-          +--------+--------+
-                   |
-                   | (2) SET infraforge:job:<id>
-                   | (3) XADD infraforge:jobs * job_id <id>
-                   v
-          +-----------------+
-          |      Redis      |   State store (JSON per job, 24h TTL) and
-          |     (compose)   |   Stream-based job queue with consumer
-          +--------+--------+   groups for at-least-once delivery.
-                   ^
-                   | (4) XREADGROUP / XACK
-                   |
-          +--------+--------+
-          |     worker      |   Long-running consumer. Loads the job,
-          |  (cmd/worker)   |   runs the provisioner, writes back the
-          +--------+--------+   outcome (ready or failed).
-                   |
-                   | (5) docker run postgres:16-alpine ...
-                   v
-          +-----------------+
-          |  Postgres       |   Per-job container, deterministically named
-          | (infraforge-pg- |   infraforge-pg-<jobID>, bound to a random
-          |     <jobID>)    |   host port on 127.0.0.1.
-          +-----------------+
-                   ^
-                   | (6) GET /v1/provision/<id> returns connection info
-                   |     once status reaches "ready"; client connects.
-                  client
+  client
+    |  POST /v1/provision {service_name, resource}
+    v
++===================+
+|      BROKER       |
+|   (cmd/broker)    |
++===================+
+    |
+    |-- request invalid (bad JSON / missing service_name) ------> 400 Bad Request
+    |
+    |   valid request:
+    |     (1) SET infraforge:job:<id>      (status: pending)
+    |     (2) XADD infraforge:jobs ...     (action: provision)
+    |
+    |-- store write or XADD fails --> job -> failed ------------> 500 {"error": ...}
+    |
+    v  202 Accepted {id, status: pending}
++===================+
+|       REDIS       |   state store: job JSON per key, no expiry
+|   state + queue   |   queue: Stream + consumer group with a
++===================+   Pending Entries List (PEL) for at-least-once
+    |   ^
+    |   |  (6) XACK -- issued only AFTER the terminal state is persisted
+    |   |
+    |   (3) XREADGROUP ">"   (brand-new, never-delivered messages)
+    v
++===================+
+|      WORKER       |
+|   (cmd/worker)    |
++===================+
+    |  (4) job -> provisioning ;  (5) docker run postgres:16-alpine
+    |
+    +-- SUCCESS -----------> job -> ready (+ connection) --> XACK
+    |                            |
+    |                            v
+    |                     GET /v1/provision/<id> returns connection info;
+    |                     client connects to container infraforge-pg-<id>
+    |
+    +-- provisioner ERROR --> job -> failed (detail) --> XACK
+    |                         deterministic failure (bad image, bad config):
+    |                         acked, NOT retried
+    |
+    +-- WORKER CRASHES mid-provision (process dies before XACK)
+              |
+              |  the message is stranded in Redis' PEL; a fresh
+              |  XREADGROUP ">" will never see it again
+              v
+        RECLAIM LOOP (the worker's second loop): XAUTOCLAIM takes over
+        messages idle longer than the reclaim threshold
+              |
+              +-- attempts <= MaxAttempts --> retry provision
+              |                               (re-enters SUCCESS / ERROR above;
+              |                                idempotent -- reuses the container)
+              |
+              +-- attempts >  MaxAttempts --> job -> failed
+                                              "abandoned after N attempts" --> XACK
 ```
+
+Teardown mirrors the spine: `DELETE /v1/provision/<id>` sets the job to
+`deleting` and `XADD`s a `deprovision` message; the worker removes the
+container and sets `deleted`.
+
 
 ### Components
 
@@ -281,6 +310,22 @@ Error responses:
 | 400 | malformed JSON, missing `service_name`, or unsupported `resource` | `{"error":"..."}` |
 | 500 | state store or queue failure | `{"error":"..."}` |
 
+### `GET /v1/provision`
+
+List every job the control plane knows about — the inventory endpoint,
+the answer to "what exists right now?". Returns all jobs, including
+terminal ones (`failed`, `deleted`), oldest first.
+
+Response `200 OK`:
+```json
+{
+  "count": 2,
+  "jobs": [
+    { "id": "af63b1957269cb82", "status": "ready", "...": "..." }
+  ]
+}
+```
+
 ### `GET /v1/provision/{id}`
 
 Fetch the current state of a job.
@@ -307,17 +352,34 @@ Response `200 OK` once the job reaches `ready`:
 Job lifecycle:
 
 ```
-pending  -->  provisioning  -->  ready
-                  |
-                  +-->  failed   (detail field carries the reason)
+pending --> provisioning --> ready --> deleting --> deleted
+                 |
+                 +--> failed   (detail field carries the reason)
 ```
 
 Error responses:
 
 | Status | Condition |
 |--------|-----------|
-| 404 | No job recorded for the given identifier (or the 24h TTL has elapsed). |
+| 404 | No job recorded for the given identifier. |
 | 500 | State store unreachable. |
+
+### `DELETE /v1/provision/{id}`
+
+Begin teardown of a job's resources. Like provisioning, this is
+asynchronous: the broker marks the job `deleting`, enqueues a deprovision
+work item onto the same Redis Stream, and returns. The worker performs
+the actual container removal and moves the job to `deleted`.
+
+| Status | Condition |
+|--------|-----------|
+| 202 | Teardown accepted; the job is now `deleting` (or was already). |
+| 200 | The job was already `deleted` — returned idempotently. |
+| 404 | No job recorded for the given identifier. |
+| 500 | State store or queue failure. |
+
+The job record is retained in the `deleted` state rather than removed,
+so a later `GET` still reports the outcome.
 
 ## How It Works
 
@@ -340,9 +402,18 @@ up.
 **Redis Streams with a consumer group, not LPUSH/BRPOP.** A list-based
 queue deletes the entry the moment the worker reads it; a crash mid-work
 loses the job. A stream with a consumer group keeps the entry in the
-group's pending entries list until the worker explicitly acks it. The
-pending list is the foundation for the retry and dead-letter behaviour
-described under [Planned Work](#planned-work).
+group's pending entries list (PEL) until the worker explicitly acks it.
+
+**Crash recovery via reclaim.** A worker that dies mid-provision leaves
+its in-flight message in the PEL; a fresh `XREADGROUP ">"` only sees
+never-delivered entries and would never touch it again. The worker
+therefore runs a second loop that periodically issues `XAUTOCLAIM`,
+taking over messages idle longer than a threshold and reprocessing them.
+Because provisioning is idempotent (deterministic container names plus
+the status checks in the worker), reprocessing a half-finished job
+converges on a single resource. A persisted `attempts` counter caps how
+many times a poison job may be retried before it is abandoned as
+`failed`.
 
 **Persist before ack.** The worker writes the terminal job state to the
 store before issuing `XACK`. If the ack fails, redelivery will hit the
@@ -514,10 +585,13 @@ docker volume rm infraforge_redis-data                  # wipe persistent Redis 
 | Project scaffolding, build, and CI | Implemented |
 | Broker HTTP API with structured responses | Implemented |
 | In-memory state store for unit tests | Implemented |
-| Redis state store with per-job TTL | Implemented |
+| Redis state store (durable, no expiry) | Implemented |
+| Job inventory endpoint (`GET /v1/provision`) | Implemented |
 | Redis Streams queue with consumer groups | Implemented |
 | Worker control loop with idempotent redelivery handling | Implemented |
 | Docker-based Postgres provisioner with `pg_isready` health gating | Implemented |
+| Asynchronous deprovisioning (`DELETE /v1/provision/{id}`) | Implemented |
+| Crash recovery via `XAUTOCLAIM` reclaim, with a retry cap | Implemented |
 | Continuous integration (vet, build, race-enabled tests) | Implemented |
 
 ## Planned Work
@@ -577,21 +651,20 @@ internal-PaaS pattern it is modeled on, and lets the system be exercised
 with realistic primitives (namespaces, RBAC, Secrets, Services) rather
 than Docker labels and host ports.
 
-### Hardening: retries, dead-letter, and deprovisioning
+### Dead-letter stream and retryable-error classification
 
-Three related improvements grouped together:
+Two refinements to the failure handling already in place:
 
-- **Retries via stream reclaim.** A pending entry that has sat in the
-  group's pending list past a configurable threshold is reclaimed via
-  `XCLAIM` and retried up to a small bounded number of times. This is
-  the operational payoff for the Streams choice made early in the
-  build.
-- **Dead-letter stream.** Jobs that exhaust retries are moved onto a
-  second stream (`infraforge:jobs:dead`) carrying the last error,
-  preserving them for inspection rather than silently dropping.
-- **Deprovisioning endpoint.** `DELETE /v1/provision/{id}` will tear
-  down every container labeled with the given job ID and mark the job
-  `deleted`, restoring symmetry to the API.
+- **Dead-letter stream.** A job abandoned after exhausting its retry cap
+  is currently just marked `failed`. Moving its stream entry onto a
+  second stream (`infraforge:jobs:dead`) carrying the last error would
+  preserve it for inspection and keep the main stream clean.
+- **Retryable-error classification.** Today a returned provisioning
+  error is treated as terminal and acked immediately; only outright
+  worker crashes are retried via reclaim. Classifying transient failures
+  (a Docker daemon hiccup) as retryable, versus permanent ones (bad
+  config), would let the reclaim machinery retry the cases that can
+  actually succeed.
 
 ### Observability
 
