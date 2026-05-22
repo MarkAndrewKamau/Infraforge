@@ -7,7 +7,7 @@ import "time"
 
 // Status is the lifecycle of a single provisioning job.
 //
-//	pending ──▶ provisioning ──▶ ready
+//	pending ──▶ provisioning ──▶ ready ──▶ deleting ──▶ deleted
 //	                  │
 //	                  └────────▶ failed
 type Status string
@@ -17,6 +17,8 @@ const (
 	StatusProvisioning Status = "provisioning"
 	StatusReady        Status = "ready"
 	StatusFailed       Status = "failed"
+	StatusDeleting     Status = "deleting"
+	StatusDeleted      Status = "deleted"
 )
 
 // ResourceType is the kind of thing a caller can ask the broker to provision.
@@ -43,8 +45,13 @@ type Job struct {
 	// Detail is a human-readable note about the current state, e.g. an
 	// error message when Status == failed.
 	Detail string `json:"detail,omitempty"`
-	// Connection is populated once Status == ready. The worker fills this
-	// in from Phase 3 onward.
+	// Attempts counts how many times a worker has begun provisioning this
+	// job. It is persisted on the job so the count survives the very
+	// crash that incremented it, which is what makes the poison-message
+	// cap in the worker reliable.
+	Attempts int `json:"attempts,omitempty"`
+	// Connection is populated once Status == ready, and cleared again on
+	// deprovision.
 	Connection *ConnectionInfo `json:"connection,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
 	UpdatedAt  time.Time       `json:"updated_at"`

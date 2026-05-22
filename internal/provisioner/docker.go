@@ -100,6 +100,23 @@ func (p *Shell) Provision(ctx context.Context, j *model.Job) (*model.ConnectionI
 	return conn, nil
 }
 
+// Deprovision removes the container backing this job. It is idempotent:
+// `docker rm -f` on a container that is already gone is reported by
+// Docker as "no such container", which we treat as success so a
+// redelivered deprovision message does not fail.
+func (p *Shell) Deprovision(ctx context.Context, j *model.Job) error {
+	name := containerName(j)
+	out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
+	if err != nil {
+		if strings.Contains(strings.ToLower(string(out)), "no such container") {
+			return nil
+		}
+		return fmt.Errorf("docker rm -f %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	p.log.Info("container removed", "name", name)
+	return nil
+}
+
 func containerName(j *model.Job) string { return "infraforge-pg-" + j.ID }
 
 type creds struct{ user, pass, db string }

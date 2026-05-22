@@ -1,5 +1,5 @@
 // Package queue is the async hand-off between the broker (producer) and
-// the worker (consumer, Phase 3).
+// the worker (consumer).
 //
 // It is built on a Redis Stream + consumer group rather than a plain list
 // (LPUSH/BRPOP). The reason is delivery guarantees:
@@ -9,9 +9,12 @@
 //
 //	Stream+group: XREADGROUP hands the entry to a consumer but keeps it in
 //	              the group's Pending Entries List (PEL) until XACK. A
-//	              crashed worker's in-flight job can be reclaimed (XCLAIM,
-//	              Phase 7) instead of vanishing. That is at-least-once
-//	              delivery, which is what provisioning needs.
+//	              crashed worker's in-flight job stays in the PEL and can
+//	              be reclaimed (XAUTOCLAIM) by a live worker. That is
+//	              at-least-once delivery, which is what provisioning needs.
+//
+// Each message also carries an Action, so the same stream can carry both
+// "provision this job" and "tear this job down" work items.
 package queue
 
 import (
@@ -24,25 +27,39 @@ import (
 )
 
 const (
-	// StreamKey is the Redis Stream all provisioning jobs flow through.
+	// StreamKey is the Redis Stream all job work items flow through.
 	StreamKey = "infraforge:jobs"
 	// Group is the consumer group the worker(s) read under.
 	Group = "provisioners"
 )
 
-// Message is one job reference pulled off the stream. ID is the Redis
-// stream entry ID and is required to XACK it.
+// Action is what the worker should do with a job.
+type Action string
+
+const (
+	ActionProvision   Action = "provision"
+	ActionDeprovision Action = "deprovision"
+)
+
+// Message is one work item pulled off the stream. ID is the Redis stream
+// entry ID and is required to XACK it.
 type Message struct {
-	ID    string
-	JobID string
+	ID     string
+	JobID  string
+	Action Action
 }
 
 type Queue interface {
-	// Enqueue appends a job reference to the stream.
-	Enqueue(ctx context.Context, jobID string) error
+	// Enqueue appends a work item to the stream.
+	Enqueue(ctx context.Context, jobID string, action Action) error
 	// Dequeue blocks up to block for the next unread message for this
 	// consumer. Returns (nil, nil) if the block elapsed with nothing.
 	Dequeue(ctx context.Context, consumer string, block time.Duration) (*Message, error)
+	// Reclaim takes ownership of messages that have been pending
+	// (delivered but unacked) longer than minIdle, reassigning them to
+	// consumer. This is the recovery path for a worker that died holding
+	// a message. Returns up to count messages.
+	Reclaim(ctx context.Context, consumer string, minIdle time.Duration, count int) ([]*Message, error)
 	// Ack removes a message from the group's pending list.
 	Ack(ctx context.Context, m *Message) error
 }
@@ -61,10 +78,10 @@ func (q *RedisQueue) EnsureGroup(ctx context.Context) error {
 	return nil
 }
 
-func (q *RedisQueue) Enqueue(ctx context.Context, jobID string) error {
+func (q *RedisQueue) Enqueue(ctx context.Context, jobID string, action Action) error {
 	return q.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: StreamKey,
-		Values: map[string]any{"job_id": jobID},
+		Values: map[string]any{"job_id": jobID, "action": string(action)},
 	}).Err()
 }
 
@@ -85,11 +102,43 @@ func (q *RedisQueue) Dequeue(ctx context.Context, consumer string, block time.Du
 	if len(res) == 0 || len(res[0].Messages) == 0 {
 		return nil, nil
 	}
-	m := res[0].Messages[0]
-	jobID, _ := m.Values["job_id"].(string)
-	return &Message{ID: m.ID, JobID: jobID}, nil
+	return messageFrom(res[0].Messages[0]), nil
+}
+
+func (q *RedisQueue) Reclaim(ctx context.Context, consumer string, minIdle time.Duration, count int) ([]*Message, error) {
+	// Start "0-0" rescans the PEL from the beginning each call. Acked
+	// messages have already left the PEL, so this converges; we do not
+	// need to thread the returned cursor across calls.
+	entries, _, err := q.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   StreamKey,
+		Group:    Group,
+		Consumer: consumer,
+		MinIdle:  minIdle,
+		Start:    "0-0",
+		Count:    int64(count),
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Message, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, messageFrom(e))
+	}
+	return out, nil
 }
 
 func (q *RedisQueue) Ack(ctx context.Context, m *Message) error {
 	return q.rdb.XAck(ctx, StreamKey, Group, m.ID).Err()
+}
+
+// messageFrom decodes a raw stream entry. A missing action field is
+// treated as provision, so entries written before actions existed (and
+// any hand-crafted XADDs) still work.
+func messageFrom(m redis.XMessage) *Message {
+	jobID, _ := m.Values["job_id"].(string)
+	action, _ := m.Values["action"].(string)
+	if action == "" {
+		action = string(ActionProvision)
+	}
+	return &Message{ID: m.ID, JobID: jobID, Action: Action(action)}
 }
