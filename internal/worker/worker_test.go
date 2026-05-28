@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/MarkAndrewKamau/infraforge/internal/model"
+	"github.com/MarkAndrewKamau/infraforge/internal/provisioner"
 	"github.com/MarkAndrewKamau/infraforge/internal/queue"
 	"github.com/MarkAndrewKamau/infraforge/internal/store"
 )
@@ -28,16 +29,16 @@ func (f *fakeQueue) Ack(_ context.Context, m *queue.Message) error {
 }
 
 type fakeProv struct {
-	conn          *model.ConnectionInfo
+	result        *provisioner.Result
 	provErr       error
 	deprovErr     error
 	provisioned   []string
 	deprovisioned []string
 }
 
-func (f *fakeProv) Provision(_ context.Context, j *model.Job) (*model.ConnectionInfo, error) {
+func (f *fakeProv) Provision(_ context.Context, j *model.Job) (*provisioner.Result, error) {
 	f.provisioned = append(f.provisioned, j.ID)
-	return f.conn, f.provErr
+	return f.result, f.provErr
 }
 func (f *fakeProv) Deprovision(_ context.Context, j *model.Job) error {
 	f.deprovisioned = append(f.deprovisioned, j.ID)
@@ -73,8 +74,11 @@ func deprovMsg(jobID string) *queue.Message {
 
 func TestHandleProvisionSuccess(t *testing.T) {
 	q := &fakeQueue{}
-	conn := &model.ConnectionInfo{Host: "127.0.0.1", Port: 54321, Database: "d"}
-	w, st := newTestWorker(&fakeProv{conn: conn}, q)
+	res := &provisioner.Result{
+		Connection: &model.ConnectionInfo{Host: "127.0.0.1", Port: 54321, Database: "d"},
+		HTTP:       &model.HTTPEndpoint{Host: "127.0.0.1", Port: 18080},
+	}
+	w, st := newTestWorker(&fakeProv{result: res}, q)
 	seed(t, st, &model.Job{ID: "j1", ServiceName: "checkout", Status: model.StatusPending})
 
 	w.handle(context.Background(), provMsg("j1"))
@@ -88,6 +92,9 @@ func TestHandleProvisionSuccess(t *testing.T) {
 	}
 	if got.Connection == nil || got.Connection.Port != 54321 {
 		t.Errorf("connection = %+v", got.Connection)
+	}
+	if got.HTTP == nil || got.HTTP.Port != 18080 {
+		t.Errorf("http = %+v, want port 18080", got.HTTP)
 	}
 	if got.Attempts != 1 {
 		t.Errorf("attempts = %d, want 1", got.Attempts)
@@ -149,7 +156,10 @@ func TestHandleProvisionAlreadyReadyIsIdempotent(t *testing.T) {
 
 func TestHandleProvisionAbandonsAfterMaxAttempts(t *testing.T) {
 	q := &fakeQueue{}
-	prov := &fakeProv{conn: &model.ConnectionInfo{}}
+	prov := &fakeProv{result: &provisioner.Result{
+		Connection: &model.ConnectionInfo{},
+		HTTP:       &model.HTTPEndpoint{},
+	}}
 	w, st := newTestWorker(prov, q)
 	// The job has already been attempted MaxAttempts times: it crashed
 	// the worker each time and kept getting reclaimed.
@@ -174,7 +184,8 @@ func TestHandleDeprovisionSuccess(t *testing.T) {
 	prov := &fakeProv{}
 	w, st := newTestWorker(prov, q)
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusDeleting,
-		Connection: &model.ConnectionInfo{Port: 1}})
+		Connection: &model.ConnectionInfo{Port: 1},
+		HTTP:       &model.HTTPEndpoint{Port: 2}})
 
 	w.handle(context.Background(), deprovMsg("j1"))
 
@@ -184,6 +195,9 @@ func TestHandleDeprovisionSuccess(t *testing.T) {
 	}
 	if got.Connection != nil {
 		t.Errorf("connection should be cleared on deprovision")
+	}
+	if got.HTTP != nil {
+		t.Errorf("http endpoint should be cleared on deprovision")
 	}
 	if len(prov.deprovisioned) != 1 {
 		t.Errorf("deprovisioner should have run once, ran %d", len(prov.deprovisioned))
