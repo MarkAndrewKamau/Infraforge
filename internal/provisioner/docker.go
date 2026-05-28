@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -16,35 +17,79 @@ import (
 	"github.com/MarkAndrewKamau/infraforge/internal/model"
 )
 
-// Shell provisions Postgres by shelling out to the `docker` CLI.
+// Shell provisions a job's resources by shelling out to the docker CLI.
 //
-// Why shell-out, not the Docker SDK? Two reasons. (1) The SDK pulls in
-// hundreds of indirect modules; for learning the control loop, that
-// noise distracts from the lesson. (2) Every command this code runs is
-// one you can paste into a terminal to debug. The Provisioner interface
-// keeps the door open to swap in the SDK later without touching the
-// worker.
+// Each job produces two siblings: a Postgres database and a companion
+// HTTP microservice. They share the infraforge.job=<id> label so a
+// single label query can list or tear down all of a job's containers,
+// no matter how many kinds it grows to have.
+//
+// Why shell-out and not the Docker SDK? The SDK pulls hundreds of
+// indirect modules and obscures what is actually happening; every
+// command this code runs is one you can paste into a terminal to
+// debug. The Provisioner interface keeps the door open to a SDK or
+// Kubernetes backend later.
 type Shell struct {
-	image string
-	log   *slog.Logger
+	postgresImage string
+	echoImage     string
+	log           *slog.Logger
 }
 
 func NewShell(log *slog.Logger) *Shell {
-	return &Shell{image: "postgres:16-alpine", log: log}
+	return &Shell{
+		postgresImage: "postgres:16-alpine",
+		echoImage:     "infraforge/echo:dev",
+		log:           log,
+	}
 }
 
-func (p *Shell) Provision(ctx context.Context, j *model.Job) (*model.ConnectionInfo, error) {
-	name := containerName(j)
+// Provision brings both sibling resources up and returns how to reach
+// them. Order matters: Postgres first, then the HTTP service. A failure
+// in either leaves the other behind, which Deprovision will clean up if
+// the worker later abandons the job.
+func (p *Shell) Provision(ctx context.Context, j *model.Job) (*Result, error) {
+	conn, err := p.provisionPostgres(ctx, j)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: %w", err)
+	}
+	httpEP, err := p.provisionHTTP(ctx, j)
+	if err != nil {
+		return nil, fmt.Errorf("http: %w", err)
+	}
+	return &Result{Connection: conn, HTTP: httpEP}, nil
+}
 
-	// --- idempotency ---
-	// Phase 2's queue is at-least-once: the same Redis message may be
-	// redelivered (e.g. a worker crashed before XACK). If a container
-	// with this job's deterministic name already exists, treat that as
-	// the canonical resource and just read its connection info back.
+// Deprovision removes every container labeled with this job's ID. A
+// single label query catches both siblings (and any future ones we add),
+// so callers do not need to know how many resources a job owns.
+func (p *Shell) Deprovision(ctx context.Context, j *model.Job) error {
+	out, err := exec.CommandContext(ctx, "docker", "ps", "-aq",
+		"-f", "label=infraforge.job="+j.ID).Output()
+	if err != nil {
+		return fmt.Errorf("docker ps: %w", err)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return nil // already gone — idempotent success
+	}
+	args := append([]string{"rm", "-f"}, ids...)
+	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker rm -f: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	p.log.Info("containers removed", "job", j.ID, "count", len(ids))
+	return nil
+}
+
+func (p *Shell) provisionPostgres(ctx context.Context, j *model.Job) (*model.ConnectionInfo, error) {
+	name := postgresName(j)
+
+	// Idempotency: an at-least-once redelivery may run us a second time;
+	// reuse what exists rather than failing on a duplicate name.
 	if inf, ok, err := dockerInspect(ctx, name); err != nil {
 		return nil, err
 	} else if ok {
-		p.log.Info("container exists, reusing", "name", name, "running", inf.State.Running)
+		p.log.Info("postgres container exists, reusing",
+			"name", name, "running", inf.State.Running)
 		if !inf.State.Running {
 			if err := dockerStart(ctx, name); err != nil {
 				return nil, err
@@ -63,23 +108,23 @@ func (p *Shell) Provision(ctx context.Context, j *model.Job) (*model.ConnectionI
 		return conn, nil
 	}
 
-	// --- create ---
 	creds := newCreds(j)
 	args := []string{
 		"run", "-d",
 		"--name", name,
-		"-p", "127.0.0.1::5432", // host picks a random port on loopback
+		"-p", "127.0.0.1::5432",
 		"-e", "POSTGRES_USER=" + creds.user,
 		"-e", "POSTGRES_PASSWORD=" + creds.pass,
 		"-e", "POSTGRES_DB=" + creds.db,
 		"--label", "infraforge=true",
 		"--label", "infraforge.job=" + j.ID,
 		"--label", "infraforge.service=" + j.ServiceName,
+		"--label", "infraforge.kind=postgres",
 		"--restart", "unless-stopped",
-		p.image,
+		p.postgresImage,
 	}
 	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("docker run: %w: %s", err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("docker run postgres: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 
 	inf, _, err := dockerInspect(ctx, name)
@@ -90,8 +135,7 @@ func (p *Shell) Provision(ctx context.Context, j *model.Job) (*model.ConnectionI
 	if err != nil {
 		return nil, err
 	}
-	// Trust the creds we just set, not what the inspect reflected (they
-	// should match, but env reflection is best avoided for secrets).
+	// Trust the creds we just set, not what env reflection produced.
 	conn.Username, conn.Password, conn.Database = creds.user, creds.pass, creds.db
 
 	if err := waitForPostgres(ctx, name, creds.user, creds.db, 30*time.Second); err != nil {
@@ -100,24 +144,73 @@ func (p *Shell) Provision(ctx context.Context, j *model.Job) (*model.ConnectionI
 	return conn, nil
 }
 
-// Deprovision removes the container backing this job. It is idempotent:
-// `docker rm -f` on a container that is already gone is reported by
-// Docker as "no such container", which we treat as success so a
-// redelivered deprovision message does not fail.
-func (p *Shell) Deprovision(ctx context.Context, j *model.Job) error {
-	name := containerName(j)
-	out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
-	if err != nil {
-		if strings.Contains(strings.ToLower(string(out)), "no such container") {
-			return nil
+func (p *Shell) provisionHTTP(ctx context.Context, j *model.Job) (*model.HTTPEndpoint, error) {
+	name := httpName(j)
+
+	if inf, ok, err := dockerInspect(ctx, name); err != nil {
+		return nil, err
+	} else if ok {
+		p.log.Info("http container exists, reusing",
+			"name", name, "running", inf.State.Running)
+		if !inf.State.Running {
+			if err := dockerStart(ctx, name); err != nil {
+				return nil, err
+			}
+			if inf, _, err = dockerInspect(ctx, name); err != nil {
+				return nil, err
+			}
 		}
-		return fmt.Errorf("docker rm -f %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+		host, port, err := hostPortOf(inf, "8080/tcp")
+		if err != nil {
+			return nil, err
+		}
+		if err := waitForHTTP(ctx, host, port, "/health", 15*time.Second); err != nil {
+			return nil, err
+		}
+		return &model.HTTPEndpoint{Host: host, Port: port}, nil
 	}
-	p.log.Info("container removed", "name", name)
-	return nil
+
+	args := []string{
+		"run", "-d",
+		"--name", name,
+		"-p", "127.0.0.1::8080",
+		"-e", "SERVICE_NAME=" + j.ServiceName,
+		"-e", "JOB_ID=" + j.ID,
+		"--label", "infraforge=true",
+		"--label", "infraforge.job=" + j.ID,
+		"--label", "infraforge.service=" + j.ServiceName,
+		"--label", "infraforge.kind=http",
+		"--restart", "unless-stopped",
+		p.echoImage,
+	}
+	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		s := strings.ToLower(string(out))
+		if strings.Contains(s, "no such image") ||
+			strings.Contains(s, "pull access denied") ||
+			strings.Contains(s, "manifest unknown") {
+			return nil, fmt.Errorf(
+				"image %s not present locally; build it once with `make build-echo`: %w",
+				p.echoImage, err)
+		}
+		return nil, fmt.Errorf("docker run echo: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	inf, _, err := dockerInspect(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPortOf(inf, "8080/tcp")
+	if err != nil {
+		return nil, err
+	}
+	if err := waitForHTTP(ctx, host, port, "/health", 15*time.Second); err != nil {
+		return nil, fmt.Errorf("echo not ready: %w", err)
+	}
+	return &model.HTTPEndpoint{Host: host, Port: port}, nil
 }
 
-func containerName(j *model.Job) string { return "infraforge-pg-" + j.ID }
+func postgresName(j *model.Job) string { return "infraforge-pg-" + j.ID }
+func httpName(j *model.Job) string     { return "infraforge-svc-" + j.ID }
 
 type creds struct{ user, pass, db string }
 
@@ -159,7 +252,9 @@ func sanitize(s string) string {
 // inspect mirrors the slice of `docker inspect <name>` we actually use.
 type inspect struct {
 	State struct{ Running bool }
+
 	Config struct{ Env []string }
+
 	NetworkSettings struct {
 		Ports map[string][]struct{ HostIp, HostPort string }
 	}
@@ -198,20 +293,29 @@ func dockerStart(ctx context.Context, name string) error {
 	return nil
 }
 
-func connectionFromInspect(inf *inspect) (*model.ConnectionInfo, error) {
-	bindings, ok := inf.NetworkSettings.Ports["5432/tcp"]
+// hostPortOf returns the host IP and host port mapped to the given
+// internal container port (e.g. "5432/tcp", "8080/tcp").
+func hostPortOf(inf *inspect, internalPort string) (string, int, error) {
+	bindings, ok := inf.NetworkSettings.Ports[internalPort]
 	if !ok || len(bindings) == 0 {
-		return nil, fmt.Errorf("no host port mapping for 5432/tcp")
+		return "", 0, fmt.Errorf("no host port mapping for %s", internalPort)
 	}
 	port, err := strconv.Atoi(bindings[0].HostPort)
 	if err != nil {
-		return nil, fmt.Errorf("invalid host port %q: %w", bindings[0].HostPort, err)
+		return "", 0, fmt.Errorf("invalid host port %q: %w", bindings[0].HostPort, err)
 	}
 	host := bindings[0].HostIp
 	if host == "" || host == "0.0.0.0" {
 		host = "127.0.0.1"
 	}
+	return host, port, nil
+}
 
+func connectionFromInspect(inf *inspect) (*model.ConnectionInfo, error) {
+	host, port, err := hostPortOf(inf, "5432/tcp")
+	if err != nil {
+		return nil, err
+	}
 	// Pull creds back from POSTGRES_* env so a reused container hands the
 	// caller the same credentials it actually has.
 	var user, pass, db string
@@ -251,6 +355,35 @@ func waitForPostgres(ctx context.Context, name, user, db string, timeout time.Du
 		}
 		select {
 		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// waitForHTTP polls path with a short per-attempt timeout. The echo
+// image is distroless: no shell, no busybox, no curl. We probe it from
+// the worker's host using the published port instead of docker exec.
+func waitForHTTP(ctx context.Context, host string, port int, path string, timeout time.Duration) error {
+	dl := time.Now().Add(timeout)
+	url := fmt.Sprintf("http://%s:%d%s", host, port, path)
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(dl) {
+			return fmt.Errorf("http readiness timed out for %s", url)
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if resp, err := client.Do(req); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
