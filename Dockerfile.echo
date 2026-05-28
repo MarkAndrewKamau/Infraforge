@@ -1,0 +1,21 @@
+# Two-stage build of the echo companion microservice.
+#
+# Builder uses the project module so the source matches what `go build
+# ./cmd/echo` produces locally. Runtime is distroless static — no shell,
+# no package manager, no libc. The image carries one statically linked
+# binary and nothing else.
+#
+# Build context is the repository root:
+#   docker build -t infraforge/echo:dev -f Dockerfile.echo .
+
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/echo ./cmd/echo
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/echo ./cmd/echo
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/echo /echo
+EXPOSE 8080
+ENTRYPOINT ["/echo"]

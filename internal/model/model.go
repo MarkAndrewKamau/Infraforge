@@ -50,18 +50,29 @@ type Job struct {
 	// crash that incremented it, which is what makes the poison-message
 	// cap in the worker reliable.
 	Attempts int `json:"attempts,omitempty"`
-	// Connection is populated once Status == ready, and cleared again on
-	// deprovision.
+	// Connection is the Postgres endpoint, populated once Status == ready
+	// and cleared again on deprovision.
 	Connection *ConnectionInfo `json:"connection,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
-	UpdatedAt  time.Time       `json:"updated_at"`
+	// HTTP is the companion microservice endpoint, populated alongside
+	// Connection. It is the routable workload for L7 routing.
+	HTTP      *HTTPEndpoint `json:"http,omitempty"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
 }
 
-// ConnectionInfo is how a caller reaches a provisioned resource.
+// ConnectionInfo is how a caller reaches a provisioned database.
 type ConnectionInfo struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Database string `json:"database"`
+}
+
+// HTTPEndpoint is how a caller reaches the companion HTTP microservice.
+// It carries no credentials: the service is unauthenticated and bound to
+// loopback on the worker's host.
+type HTTPEndpoint struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
 }

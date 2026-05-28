@@ -188,7 +188,7 @@ func (w *Worker) provision(ctx context.Context, log *slog.Logger, msg *queue.Mes
 	job.UpdatedAt = now()
 	_ = w.Store.Put(ctx, job)
 
-	conn, err := w.Provision.Provision(ctx, job)
+	res, err := w.Provision.Provision(ctx, job)
 	if err != nil {
 		log.Error("provision failed", "err", err)
 		job.Status = model.StatusFailed
@@ -204,7 +204,8 @@ func (w *Worker) provision(ctx context.Context, log *slog.Logger, msg *queue.Mes
 	}
 
 	job.Status = model.StatusReady
-	job.Connection = conn
+	job.Connection = res.Connection
+	job.HTTP = res.HTTP
 	job.Detail = ""
 	job.UpdatedAt = now()
 	_ = w.Store.Put(ctx, job)
@@ -213,7 +214,10 @@ func (w *Worker) provision(ctx context.Context, log *slog.Logger, msg *queue.Mes
 		// and any redelivery hits the StatusReady early-return above.
 		log.Warn("ack failed after success", "err", err)
 	}
-	log.Info("provisioned", "host", conn.Host, "port", conn.Port, "db", conn.Database)
+	log.Info("provisioned",
+		"db_host", res.Connection.Host, "db_port", res.Connection.Port,
+		"db", res.Connection.Database,
+		"http_host", res.HTTP.Host, "http_port", res.HTTP.Port)
 }
 
 func (w *Worker) deprovision(ctx context.Context, log *slog.Logger, msg *queue.Message, job *model.Job) {
@@ -239,6 +243,7 @@ func (w *Worker) deprovision(ctx context.Context, log *slog.Logger, msg *queue.M
 	job.Status = model.StatusDeleted
 	job.Detail = ""
 	job.Connection = nil
+	job.HTTP = nil
 	job.UpdatedAt = now()
 	_ = w.Store.Put(ctx, job)
 	_ = w.Queue.Ack(ctx, msg)

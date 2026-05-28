@@ -88,13 +88,16 @@ Numbered steps are the calls made between components.
 |      WORKER       |
 |   (cmd/worker)    |
 +===================+
-    |  (4) job -> provisioning ;  (5) docker run postgres:16-alpine
+    |  (4) job -> provisioning
+    |  (5) docker run postgres:16-alpine    -> infraforge-pg-<id>
+    |      docker run infraforge/echo:dev   -> infraforge-svc-<id>
+    |      (both labeled infraforge.job=<id> so teardown is one query)
     |
-    +-- SUCCESS -----------> job -> ready (+ connection) --> XACK
+    +-- SUCCESS -----------> job -> ready (+ connection, + http) --> XACK
     |                            |
     |                            v
-    |                     GET /v1/provision/<id> returns connection info;
-    |                     client connects to container infraforge-pg-<id>
+    |                     GET /v1/provision/<id> returns both endpoints;
+    |                     client connects to Postgres or hits the HTTP service
     |
     +-- provisioner ERROR --> job -> failed (detail) --> XACK
     |                         deterministic failure (bad image, bad config):
@@ -117,8 +120,8 @@ Numbered steps are the calls made between components.
 ```
 
 Teardown mirrors the spine: `DELETE /v1/provision/<id>` sets the job to
-`deleting` and `XADD`s a `deprovision` message; the worker removes the
-container and sets `deleted`.
+`deleting` and `XADD`s a `deprovision` message; the worker removes every
+container labeled `infraforge.job=<id>` in one query and sets `deleted`.
 
 
 ### Components
@@ -127,6 +130,7 @@ container and sets `deleted`.
 |-----------|------|----------------|
 | Broker | `cmd/broker` | HTTP entrypoint. Validates requests, persists jobs, enqueues. |
 | Worker | `cmd/worker` | Consumes the queue, drives the provisioner, updates state. |
+| Echo service | `cmd/echo` | Tiny HTTP companion microservice provisioned per job. Image `infraforge/echo:dev` built from `Dockerfile.echo`. |
 | API | `internal/api` | HTTP handlers and routing for the broker. |
 | Model | `internal/model` | Wire and state types shared across packages. |
 | Store | `internal/store` | Job state. In-memory and Redis implementations behind one interface. |
@@ -590,6 +594,8 @@ docker volume rm infraforge_redis-data                  # wipe persistent Redis 
 | Redis Streams queue with consumer groups | Implemented |
 | Worker control loop with idempotent redelivery handling | Implemented |
 | Docker-based Postgres provisioner with `pg_isready` health gating | Implemented |
+| Companion HTTP microservice (`cmd/echo`) provisioned alongside Postgres | Implemented |
+| Label-based deprovisioning that catches every sibling container | Implemented |
 | Asynchronous deprovisioning (`DELETE /v1/provision/{id}`) | Implemented |
 | Crash recovery via `XAUTOCLAIM` reclaim, with a retry cap | Implemented |
 | Continuous integration (vet, build, race-enabled tests) | Implemented |
@@ -599,25 +605,6 @@ docker volume rm infraforge_redis-data                  # wipe persistent Redis 
 The following items extend the system beyond pure database provisioning
 and are scheduled as the next milestones. They are listed in priority
 order.
-
-### Companion HTTP microservice per provision
-
-Every provisioning request will produce two resources rather than one:
-the Postgres container described above, plus a small HTTP service that
-represents the application using that database. The HTTP service exposes
-`/health` and `/whoami` endpoints and binds to a random host port on
-loopback.
-
-Motivation: Postgres speaks raw TCP and is therefore an awkward subject
-for a Layer 7 proxy. An HTTP companion gives the system a workload that
-the routing layer described below can meaningfully dispatch to, and
-mirrors the real-world shape where a deployed service has both a public
-HTTP surface and a private datastore.
-
-The change adds an `HTTPEndpoint` field to `model.Job` alongside the
-existing `Connection`, extends the worker's provisioning step to bring
-up the companion container, and labels both containers with the same
-`infraforge.job=<id>` so cleanup remains a single command.
 
 ### Dynamic L7 routing via Envoy and an xDS control plane
 
