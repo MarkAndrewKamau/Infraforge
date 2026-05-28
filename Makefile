@@ -1,12 +1,23 @@
-.PHONY: broker worker test vet tidy deps-up deps-down clean-pg
+.PHONY: broker worker test vet tidy deps-up deps-down clean-pg build-echo force-build-echo
 
 # Run the control-plane broker (Phase 1).
 broker:
 	go run ./cmd/broker
 
-# Run the background provisioning worker (Phase 3).
-worker:
+# Run the background provisioning worker. Depends on build-echo so the
+# echo image is present before the first provision request lands.
+worker: build-echo
 	go run ./cmd/worker
+
+# Build the companion HTTP microservice image. The check skips the build
+# when the image already exists locally; use force-build-echo to rebuild
+# unconditionally after editing cmd/echo or Dockerfile.echo.
+build-echo:
+	@docker image inspect infraforge/echo:dev >/dev/null 2>&1 || \
+		$(MAKE) force-build-echo
+
+force-build-echo:
+	docker build -t infraforge/echo:dev -f Dockerfile.echo .
 
 test:
 	go test ./... -race
