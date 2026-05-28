@@ -1,11 +1,10 @@
-// Package provisioner turns a Job into a real running resource, and tears
-// it down again.
+// Package provisioner turns a Job into running resources, and tears
+// them down again.
 //
-// The interface is intentionally tiny: the worker depends on Provision()
-// and Deprovision() and nothing else, so tests can substitute a fake
-// without dragging in Docker. The shell-out Docker implementation lives
-// in docker.go; a future Kubernetes or Docker-SDK implementation would
-// simply implement Provisioner too.
+// A single job produces more than one container — currently a Postgres
+// database and a companion HTTP microservice. Result carries both
+// endpoints so the worker can persist them together; a future
+// Kubernetes or SDK-based implementation would return the same shape.
 package provisioner
 
 import (
@@ -14,12 +13,18 @@ import (
 	"github.com/MarkAndrewKamau/infraforge/internal/model"
 )
 
+// Result is what Provision returns once a job's resources are running.
+type Result struct {
+	Connection *model.ConnectionInfo
+	HTTP       *model.HTTPEndpoint
+}
+
 type Provisioner interface {
-	// Provision brings the job's resource into existence and returns how
-	// to reach it. It must be idempotent: called twice for the same job
-	// it returns the same resource, not a duplicate.
-	Provision(ctx context.Context, j *model.Job) (*model.ConnectionInfo, error)
-	// Deprovision removes the job's resource. It must be idempotent: a
-	// resource that is already gone is a success, not an error.
+	// Provision brings the job's resources into existence and returns
+	// how to reach them. It must be idempotent: called twice for the
+	// same job it returns the same resources, not duplicates.
+	Provision(ctx context.Context, j *model.Job) (*Result, error)
+	// Deprovision removes every resource belonging to the job. It must
+	// be idempotent: resources that are already gone are a success.
 	Deprovision(ctx context.Context, j *model.Job) error
 }
