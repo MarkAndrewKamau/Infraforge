@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -13,6 +14,20 @@ import (
 	"github.com/MarkAndrewKamau/infraforge/internal/queue"
 	"github.com/MarkAndrewKamau/infraforge/internal/store"
 )
+
+type fakeXDS struct {
+	registered   []string
+	unregistered []string
+}
+
+func (f *fakeXDS) Register(_ context.Context, svc, host string, port int) error {
+	f.registered = append(f.registered, fmt.Sprintf("%s|%s:%d", svc, host, port))
+	return nil
+}
+func (f *fakeXDS) Unregister(_ context.Context, svc, host string, port int) error {
+	f.unregistered = append(f.unregistered, fmt.Sprintf("%s|%s:%d", svc, host, port))
+	return nil
+}
 
 type fakeQueue struct{ acked []string }
 
@@ -45,17 +60,19 @@ func (f *fakeProv) Deprovision(_ context.Context, j *model.Job) error {
 	return f.deprovErr
 }
 
-func newTestWorker(prov *fakeProv, q *fakeQueue) (*Worker, store.Store) {
+func newTestWorker(prov *fakeProv, q *fakeQueue) (*Worker, store.Store, *fakeXDS) {
 	st := store.NewMem()
+	xds := &fakeXDS{}
 	w := &Worker{
 		Name:        "test",
 		Store:       st,
 		Queue:       q,
 		Provision:   prov,
+		XDS:         xds,
 		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxAttempts: 3,
 	}
-	return w, st
+	return w, st, xds
 }
 
 func seed(t *testing.T, st store.Store, j *model.Job) {
@@ -78,7 +95,7 @@ func TestHandleProvisionSuccess(t *testing.T) {
 		Connection: &model.ConnectionInfo{Host: "127.0.0.1", Port: 54321, Database: "d"},
 		HTTP:       &model.HTTPEndpoint{Host: "127.0.0.1", Port: 18080},
 	}
-	w, st := newTestWorker(&fakeProv{result: res}, q)
+	w, st, xds := newTestWorker(&fakeProv{result: res}, q)
 	seed(t, st, &model.Job{ID: "j1", ServiceName: "checkout", Status: model.StatusPending})
 
 	w.handle(context.Background(), provMsg("j1"))
@@ -102,11 +119,14 @@ func TestHandleProvisionSuccess(t *testing.T) {
 	if len(q.acked) != 1 {
 		t.Errorf("acked = %v, want one", q.acked)
 	}
+	if len(xds.registered) != 1 || xds.registered[0] != "checkout|127.0.0.1:18080" {
+		t.Errorf("xds registered = %v, want one entry for checkout", xds.registered)
+	}
 }
 
 func TestHandleProvisionFailureMarksFailed(t *testing.T) {
 	q := &fakeQueue{}
-	w, st := newTestWorker(&fakeProv{provErr: errors.New("docker exploded")}, q)
+	w, st, _ := newTestWorker(&fakeProv{provErr: errors.New("docker exploded")}, q)
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusPending})
 
 	w.handle(context.Background(), provMsg("j1"))
@@ -126,7 +146,7 @@ func TestHandleProvisionFailureMarksFailed(t *testing.T) {
 func TestHandleProvisionMissingJobAcks(t *testing.T) {
 	q := &fakeQueue{}
 	prov := &fakeProv{}
-	w, _ := newTestWorker(prov, q)
+	w, _, _ := newTestWorker(prov, q)
 
 	w.handle(context.Background(), provMsg("ghost"))
 
@@ -141,7 +161,7 @@ func TestHandleProvisionMissingJobAcks(t *testing.T) {
 func TestHandleProvisionAlreadyReadyIsIdempotent(t *testing.T) {
 	q := &fakeQueue{}
 	prov := &fakeProv{}
-	w, st := newTestWorker(prov, q)
+	w, st, _ := newTestWorker(prov, q)
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusReady})
 
 	w.handle(context.Background(), provMsg("j1"))
@@ -160,7 +180,7 @@ func TestHandleProvisionAbandonsAfterMaxAttempts(t *testing.T) {
 		Connection: &model.ConnectionInfo{},
 		HTTP:       &model.HTTPEndpoint{},
 	}}
-	w, st := newTestWorker(prov, q)
+	w, st, _ := newTestWorker(prov, q)
 	// The job has already been attempted MaxAttempts times: it crashed
 	// the worker each time and kept getting reclaimed.
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusProvisioning, Attempts: 3})
@@ -182,10 +202,10 @@ func TestHandleProvisionAbandonsAfterMaxAttempts(t *testing.T) {
 func TestHandleDeprovisionSuccess(t *testing.T) {
 	q := &fakeQueue{}
 	prov := &fakeProv{}
-	w, st := newTestWorker(prov, q)
-	seed(t, st, &model.Job{ID: "j1", Status: model.StatusDeleting,
+	w, st, xds := newTestWorker(prov, q)
+	seed(t, st, &model.Job{ID: "j1", ServiceName: "checkout", Status: model.StatusDeleting,
 		Connection: &model.ConnectionInfo{Port: 1},
-		HTTP:       &model.HTTPEndpoint{Port: 2}})
+		HTTP:       &model.HTTPEndpoint{Host: "127.0.0.1", Port: 2}})
 
 	w.handle(context.Background(), deprovMsg("j1"))
 
@@ -205,12 +225,15 @@ func TestHandleDeprovisionSuccess(t *testing.T) {
 	if len(q.acked) != 1 {
 		t.Errorf("expected ack")
 	}
+	if len(xds.unregistered) != 1 || xds.unregistered[0] != "checkout|127.0.0.1:2" {
+		t.Errorf("xds unregistered = %v, want one entry for checkout", xds.unregistered)
+	}
 }
 
 func TestHandleDeprovisionFailureKeepsDeleting(t *testing.T) {
 	q := &fakeQueue{}
 	prov := &fakeProv{deprovErr: errors.New("rm failed")}
-	w, st := newTestWorker(prov, q)
+	w, st, _ := newTestWorker(prov, q)
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusDeleting})
 
 	w.handle(context.Background(), deprovMsg("j1"))

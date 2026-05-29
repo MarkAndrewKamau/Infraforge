@@ -19,6 +19,7 @@ import (
 	"github.com/MarkAndrewKamau/infraforge/internal/provisioner"
 	"github.com/MarkAndrewKamau/infraforge/internal/queue"
 	"github.com/MarkAndrewKamau/infraforge/internal/store"
+	"github.com/MarkAndrewKamau/infraforge/internal/xdsclient"
 )
 
 const (
@@ -37,7 +38,11 @@ type Worker struct {
 	Store     store.Store
 	Queue     queue.Queue
 	Provision provisioner.Provisioner
-	Log       *slog.Logger
+	// XDS is notified after each successful provision and before each
+	// deprovision so Envoy's live routing follows the resource state.
+	// xdsclient.Noop is a valid value when no control plane is running.
+	XDS xdsclient.Client
+	Log *slog.Logger
 
 	// BlockTimeout is how long XREADGROUP blocks per main-loop iteration.
 	BlockTimeout time.Duration
@@ -65,6 +70,9 @@ func (w *Worker) applyDefaults() {
 	}
 	if w.MaxAttempts == 0 {
 		w.MaxAttempts = defaultMaxAttempts
+	}
+	if w.XDS == nil {
+		w.XDS = xdsclient.Noop{}
 	}
 }
 
@@ -209,6 +217,16 @@ func (w *Worker) provision(ctx context.Context, log *slog.Logger, msg *queue.Mes
 	job.Detail = ""
 	job.UpdatedAt = now()
 	_ = w.Store.Put(ctx, job)
+
+	// Tell the xDS control plane about the new HTTP endpoint so Envoy
+	// can route to it live. Failure is a warning, not a job failure: the
+	// container is real and reachable directly via its port; only routing
+	// through Envoy is temporarily missing.
+	if err := w.XDS.Register(ctx, job.ServiceName, res.HTTP.Host, res.HTTP.Port); err != nil {
+		log.Warn("xds register failed; resource is up but Envoy will not route to it",
+			"err", err)
+	}
+
 	if err := w.Queue.Ack(ctx, msg); err != nil {
 		// Ack failure here is recoverable: the state is already correct,
 		// and any redelivery hits the StatusReady early-return above.
@@ -225,6 +243,16 @@ func (w *Worker) deprovision(ctx context.Context, log *slog.Logger, msg *queue.M
 		log.Info("job already deleted, acking redelivery")
 		_ = w.Queue.Ack(ctx, msg)
 		return
+	}
+
+	// Unregister from xDS first so Envoy stops sending new traffic to a
+	// backend about to disappear. Failure is a warning only — teardown
+	// proceeds either way; a stale cluster entry without endpoints is
+	// harmless beyond a 503 from Envoy.
+	if job.HTTP != nil {
+		if err := w.XDS.Unregister(ctx, job.ServiceName, job.HTTP.Host, job.HTTP.Port); err != nil {
+			log.Warn("xds unregister failed; proceeding with teardown", "err", err)
+		}
 	}
 
 	if err := w.Provision.Deprovision(ctx, job); err != nil {

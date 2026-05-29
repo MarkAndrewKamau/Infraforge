@@ -123,6 +123,26 @@ Teardown mirrors the spine: `DELETE /v1/provision/<id>` sets the job to
 `deleting` and `XADD`s a `deprovision` message; the worker removes every
 container labeled `infraforge.job=<id>` in one query and sets `deleted`.
 
+Dynamic routing runs as a side-channel off the success path. After the
+worker writes a job to `ready` it calls the xDS control plane to register
+the HTTP endpoint; on deprovision it unregisters before the container is
+removed:
+
+```
+worker (success) ---> POST /v1/register {service, host, port} ---> xds control plane
+worker (delete)  ---> POST /v1/unregister                          (rebuilds snapshot,
+                                                                    pushes via ADS gRPC)
+                                                                            |
+                                                                            v
+                                                                          Envoy
+                                                          (cluster + route appear/disappear
+                                                           live; no restart, no edit)
+```
+
+xDS push failures are warnings, not job failures: the provisioned
+container is real and reachable directly even if Envoy routing is
+temporarily out of sync.
+
 
 ### Components
 
@@ -131,6 +151,10 @@ container labeled `infraforge.job=<id>` in one query and sets `deleted`.
 | Broker | `cmd/broker` | HTTP entrypoint. Validates requests, persists jobs, enqueues. |
 | Worker | `cmd/worker` | Consumes the queue, drives the provisioner, updates state. |
 | Echo service | `cmd/echo` | Tiny HTTP companion microservice provisioned per job. Image `infraforge/echo:dev` built from `Dockerfile.echo`. |
+| xDS control plane | `cmd/xds` | gRPC ADS (`:18000`) for Envoy + HTTP admin (`:19000`) for the worker. Rebuilds and pushes the Envoy snapshot on every register/unregister. |
+| xDS snapshot builder | `internal/xds` | Turns the per-service endpoint registry into Envoy `Cluster`, `RouteConfiguration` and `Listener` resources. |
+| xDS client | `internal/xdsclient` | Small HTTP client the worker uses to talk to the control plane. Has a Noop implementation so the worker still works without the control plane running. |
+| Envoy | `configs/envoy/bootstrap.yaml` | Single edge listener on `:10000` configured entirely via ADS — only the xDS cluster itself is static. |
 | API | `internal/api` | HTTP handlers and routing for the broker. |
 | Model | `internal/model` | Wire and state types shared across packages. |
 | Store | `internal/store` | Job state. In-memory and Redis implementations behind one interface. |
@@ -163,11 +187,19 @@ container labeled `infraforge.job=<id>` in one query and sets `deleted`.
 |   |-- provisioner/             Resource lifecycle implementations
 |   |   |-- provisioner.go       Interface
 |   |   `-- docker.go            Docker CLI implementation
+|   |-- xds/                     Envoy snapshot builder + registry
+|   |   `-- registry.go
+|   |-- xdsclient/               Worker's HTTP client to the xDS control plane
+|   |   `-- client.go
 |   `-- worker/                  Worker control loop
 |       |-- worker.go
 |       `-- worker_test.go
+|-- cmd/echo                     Companion HTTP microservice
+|-- cmd/xds                      Envoy xDS / ADS control plane
+|-- configs/envoy/bootstrap.yaml Envoy bootstrap (everything dynamic via ADS)
+|-- Dockerfile.echo              Multi-stage build for the echo image
 |-- .github/workflows/ci.yml     Continuous integration
-|-- docker-compose.yml           Redis container
+|-- docker-compose.yml           Redis + Envoy
 |-- Makefile                     Common developer commands
 |-- go.mod
 `-- README.md
@@ -237,7 +269,41 @@ docker exec infraforge-pg-$ID psql -U <username> -d <database> \
   -c 'SELECT version();'
 ```
 
-To shut down:
+### With live Envoy routing
+
+`make deps-up` brings up both Redis and Envoy. To exercise the dynamic
+L7 routing, add the xDS control plane and point the worker at it:
+
+```bash
+# Terminal 1 — xDS control plane (gRPC :18000, HTTP admin :19000)
+make xds
+
+# Terminal 2 — broker, unchanged
+make broker
+
+# Terminal 3 — worker with xDS push enabled
+XDS_ADDR=localhost:19000 make worker
+
+# Terminal 4 — provision a couple of services, then route through Envoy
+curl -s -X POST localhost:8080/v1/provision -d '{"service_name":"checkout"}' >/dev/null
+curl -s -X POST localhost:8080/v1/provision -d '{"service_name":"billing"}'  >/dev/null
+# Wait until both are ready, then:
+curl -s localhost:10000/checkout/whoami
+curl -s localhost:10000/billing/whoami
+
+# Watch the live registry:
+curl -s localhost:19000/v1/routes
+
+# Provision a second checkout for round-robin demo:
+curl -s -X POST localhost:8080/v1/provision -d '{"service_name":"checkout"}' >/dev/null
+for i in 1 2 3 4; do curl -s localhost:10000/checkout/whoami; done
+```
+
+`DELETE /v1/provision/<id>` removes the endpoint from Envoy live; if it
+was the last endpoint of a service the entire cluster vanishes and the
+route returns 404 within milliseconds.
+
+### To shut down
 
 ```bash
 # Ctrl-C the broker and the worker.
@@ -262,6 +328,16 @@ All runtime knobs are environment variables. Defaults are listed below.
 |----------|---------|-------------|
 | `REDIS_ADDR` | `localhost:6379` | Redis host and port. |
 | `WORKER_NAME` | `<hostname>-1` | Consumer name within the Redis stream group. Each running worker needs a distinct name. |
+| `WORKER_RECLAIM_EVERY` | `30s` | How often the reclaim loop runs. |
+| `WORKER_RECLAIM_MIN_IDLE` | `2m` | Pending-message idle time before the reclaim loop takes over. |
+| `XDS_ADDR` | unset | If set (e.g. `localhost:19000`), the worker pushes register/unregister to the xDS control plane. If unset the worker uses a no-op client and Envoy routing is not maintained. |
+
+### xDS control plane (`cmd/xds`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `XDS_GRPC_ADDR` | `:18000` | Address the ADS gRPC server binds to. Envoy connects here. |
+| `XDS_HTTP_ADDR` | `:19000` | Address the admin HTTP server binds to. The worker posts register/unregister here. |
 
 ## HTTP API Reference
 
@@ -500,7 +576,10 @@ request.
 | Target | Purpose |
 |--------|---------|
 | `make broker` | Run the broker against the current Go source. |
-| `make worker` | Run the worker against the current Go source. |
+| `make worker` | Run the worker against the current Go source. Depends on `build-echo`. |
+| `make xds` | Run the Envoy xDS / ADS control plane. |
+| `make build-echo` | Build the companion HTTP microservice image (`infraforge/echo:dev`) if missing. |
+| `make force-build-echo` | Rebuild the echo image unconditionally. |
 | `make test` | Run the unit test suite with the race detector. |
 | `make vet` | Run `go vet ./...`. |
 | `make tidy` | Run `go mod tidy`. |
@@ -598,6 +677,9 @@ docker volume rm infraforge_redis-data                  # wipe persistent Redis 
 | Label-based deprovisioning that catches every sibling container | Implemented |
 | Asynchronous deprovisioning (`DELETE /v1/provision/{id}`) | Implemented |
 | Crash recovery via `XAUTOCLAIM` reclaim, with a retry cap | Implemented |
+| Envoy data plane fed by an xDS/ADS control plane (`cmd/xds`) | Implemented |
+| Live L7 routing: `localhost:10000/<service>/...` to the HTTP companion | Implemented |
+| Round-robin load balancing across multiple provisions of one service | Implemented |
 | Continuous integration (vet, build, race-enabled tests) | Implemented |
 
 ## Planned Work
@@ -606,23 +688,14 @@ The following items extend the system beyond pure database provisioning
 and are scheduled as the next milestones. They are listed in priority
 order.
 
-### Dynamic L7 routing via Envoy and an xDS control plane
+### Reconcile xDS state from the store on startup
 
-A Go control plane will run alongside the broker, speaking the Envoy
-aggregated discovery service (ADS) protocol over gRPC. When the worker
-finishes provisioning a companion HTTP microservice, it notifies the
-control plane; the control plane synthesises an updated Envoy
-configuration (a new cluster, a new route) and pushes it to a local
-Envoy data plane without a restart.
-
-The end-to-end effect: a single Envoy listener becomes the routable
-entry point for every service Infraforge has provisioned, and adding a
-service is a config push, not a deploy. This is the closest analog to
-what large platform teams operate as a "service mesh" or "edge router."
-
-Implementation will lean on `github.com/envoyproxy/go-control-plane` to
-avoid hand-rolling the xDS protocol. Envoy itself will run as a
-container described in `docker-compose.yml`.
+The xDS control plane keeps its registry in memory. If `cmd/xds`
+restarts, the registry is empty until the next provision or deprovision
+republishes. A small reconciler that, on startup, calls
+`GET /v1/provision` on the broker and registers every `ready` job's
+HTTP endpoint would close that gap. Not load-bearing day to day, but
+the right shape for a production-style controller.
 
 ### Kubernetes provisioning target
 
