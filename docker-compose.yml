@@ -13,5 +13,25 @@ services:
     volumes:
       - redis-data:/data
 
+  envoy:
+    # Distroless variant: runs envoy directly with no shell entrypoint.
+    # The regular envoyproxy/envoy image's entrypoint tries to chown
+    # /dev/stdout, which fails under network_mode: host.
+    image: envoyproxy/envoy:distroless-v1.32-latest
+    container_name: infraforge-envoy
+    # network_mode: host so Envoy can reach both the xDS control plane
+    # (127.0.0.1:18000) and the per-service HTTP containers (also on
+    # 127.0.0.1, on random host ports) without docker network plumbing.
+    # Linux-only; on macOS/Windows you would publish ports and use
+    # extra_hosts: host.docker.internal:host-gateway instead.
+    network_mode: host
+    volumes:
+      # :z relabels the file with a shared SELinux context. Required on
+      # Fedora / RHEL where SELinux is enforcing and would otherwise deny
+      # the container process access to the host file. The :ro keeps the
+      # mount read-only.
+      - ./configs/envoy/bootstrap.yaml:/etc/envoy/envoy.yaml:ro,z
+    command: ["-c", "/etc/envoy/envoy.yaml"]
+
 volumes:
   redis-data:
