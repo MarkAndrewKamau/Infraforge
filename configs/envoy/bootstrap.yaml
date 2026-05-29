@@ -1,0 +1,49 @@
+# Minimal Envoy bootstrap. Everything dynamic — listener, route config
+# and clusters all come from the xDS control plane over a single ADS
+# stream. The only static piece is the cluster pointing AT that control
+# plane.
+#
+# node.id MUST match xds.NodeID in the Go control plane. The snapshot is
+# keyed under this identifier.
+
+node:
+  id: infraforge-edge
+  cluster: infraforge
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc:
+          cluster_name: xds_cluster
+  cds_config:
+    resource_api_version: V3
+    ads: {}
+  lds_config:
+    resource_api_version: V3
+    ads: {}
+
+static_resources:
+  clusters:
+    - name: xds_cluster
+      type: STATIC
+      connect_timeout: 1s
+      # xDS is delivered over HTTP/2. Without this option Envoy would
+      # speak HTTP/1.1 to the control plane and the gRPC handshake fails.
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 18000 }
