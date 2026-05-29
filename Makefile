@@ -1,4 +1,4 @@
-.PHONY: broker worker test vet tidy deps-up deps-down clean-pg build-echo force-build-echo
+.PHONY: broker worker xds test vet tidy deps-up deps-down clean-pg build-echo force-build-echo
 
 # Run the control-plane broker (Phase 1).
 broker:
@@ -8,6 +8,11 @@ broker:
 # echo image is present before the first provision request lands.
 worker: build-echo
 	go run ./cmd/worker
+
+# Run the xDS control plane: gRPC ADS on :18000 (for Envoy) plus HTTP
+# admin on :19000 (for the worker to register endpoints).
+xds:
+	go run ./cmd/xds
 
 # Build the companion HTTP microservice image. The check skips the build
 # when the image already exists locally; use force-build-echo to rebuild
