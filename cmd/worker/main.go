@@ -15,6 +15,7 @@ import (
 	"github.com/MarkAndrewKamau/infraforge/internal/queue"
 	"github.com/MarkAndrewKamau/infraforge/internal/store"
 	"github.com/MarkAndrewKamau/infraforge/internal/worker"
+	"github.com/MarkAndrewKamau/infraforge/internal/xdsclient"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -35,11 +36,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Pick the xDS client based on whether a control plane is running.
+	// XDS_ADDR unset -> noop, and the worker is indistinguishable from
+	// Phase 4 (provisioning still works, just no live Envoy routing).
+	var xds xdsclient.Client = xdsclient.Noop{}
+	if addr := os.Getenv("XDS_ADDR"); addr != "" {
+		xds = xdsclient.NewHTTP(addr)
+		log.Info("xds enabled", "addr", addr)
+	}
+
 	w := &worker.Worker{
 		Name:      envOr("WORKER_NAME", hostname()+"-1"),
 		Store:     store.NewRedis(rdb),
 		Queue:     q,
 		Provision: provisioner.NewShell(log),
+		XDS:       xds,
 		Log:       log,
 		// Reclaim and retry tunables. Zero values fall back to the
 		// worker package defaults; the env vars exist mostly so crash
