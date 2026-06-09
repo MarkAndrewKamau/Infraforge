@@ -112,6 +112,53 @@ func (r *Registry) PushEmpty(ctx context.Context) error {
 	return r.pushSnapshot(ctx, snap)
 }
 
+// ReplaceAll wholesale-replaces the registry from a reconciliation
+// source (typically the broker's job inventory). It only pushes a new
+// Envoy snapshot when the desired state actually differs from current —
+// so a quiet reconcile tick does not bump the version or wake Envoy up
+// for nothing.
+//
+// Returns (changed, err) so the caller can log a no-op reconcile
+// distinctly from one that fixed drift.
+func (r *Registry) ReplaceAll(ctx context.Context, desired map[string][]Endpoint) (bool, error) {
+	r.mu.Lock()
+	if r.equalLocked(desired) {
+		r.mu.Unlock()
+		return false, nil
+	}
+	r.services = make(map[string]map[string]Endpoint, len(desired))
+	for svc, eps := range desired {
+		bucket := make(map[string]Endpoint, len(eps))
+		for _, e := range eps {
+			bucket[endpointKey(e)] = e
+		}
+		r.services[svc] = bucket
+	}
+	snap := r.buildLocked()
+	r.mu.Unlock()
+	return true, r.pushSnapshot(ctx, snap)
+}
+
+// equalLocked compares the current registry against a desired snapshot.
+// Caller must hold r.mu.
+func (r *Registry) equalLocked(desired map[string][]Endpoint) bool {
+	if len(r.services) != len(desired) {
+		return false
+	}
+	for svc, wantList := range desired {
+		have := r.services[svc]
+		if len(have) != len(wantList) {
+			return false
+		}
+		for _, e := range wantList {
+			if _, ok := have[endpointKey(e)]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // List returns a stable, sorted snapshot of the registry — handy for the
 // /v1/routes inspection endpoint.
 func (r *Registry) List() map[string][]Endpoint {
