@@ -141,7 +141,11 @@ worker (delete)  ---> POST /v1/unregister                          (rebuilds sna
 
 xDS push failures are warnings, not job failures: the provisioned
 container is real and reachable directly even if Envoy routing is
-temporarily out of sync.
+temporarily out of sync. A reconciler inside `cmd/xds` periodically
+pulls `GET /v1/provision` from the broker and replaces the registry
+wholesale — so a missed event from when xds was unreachable, or a fresh
+xds process with an empty registry, both heal automatically within one
+reconcile tick (or instantly at startup before Envoy even connects).
 
 
 ### Components
@@ -338,6 +342,8 @@ All runtime knobs are environment variables. Defaults are listed below.
 |----------|---------|-------------|
 | `XDS_GRPC_ADDR` | `:18000` | Address the ADS gRPC server binds to. Envoy connects here. |
 | `XDS_HTTP_ADDR` | `:19000` | Address the admin HTTP server binds to. The worker posts register/unregister here. |
+| `BROKER_ADDR` | `localhost:8080` | Where the reconciler reads the authoritative job inventory from. |
+| `XDS_RECONCILE_EVERY` | `60s` | How often the reconciler re-pulls the broker inventory. `0` disables the periodic loop (the initial reconcile at startup always runs). |
 
 ## HTTP API Reference
 
@@ -680,6 +686,7 @@ docker volume rm infraforge_redis-data                  # wipe persistent Redis 
 | Envoy data plane fed by an xDS/ADS control plane (`cmd/xds`) | Implemented |
 | Live L7 routing: `localhost:10000/<service>/...` to the HTTP companion | Implemented |
 | Round-robin load balancing across multiple provisions of one service | Implemented |
+| xDS reconciler: pulls the broker job inventory at startup and periodically, healing drift after an xds restart or a missed register event | Implemented |
 | Continuous integration (vet, build, race-enabled tests) | Implemented |
 
 ## Planned Work
@@ -687,15 +694,6 @@ docker volume rm infraforge_redis-data                  # wipe persistent Redis 
 The following items extend the system beyond pure database provisioning
 and are scheduled as the next milestones. They are listed in priority
 order.
-
-### Reconcile xDS state from the store on startup
-
-The xDS control plane keeps its registry in memory. If `cmd/xds`
-restarts, the registry is empty until the next provision or deprovision
-republishes. A small reconciler that, on startup, calls
-`GET /v1/provision` on the broker and registers every `ready` job's
-HTTP endpoint would close that gap. Not load-bearing day to day, but
-the right shape for a production-style controller.
 
 ### Kubernetes provisioning target
 
