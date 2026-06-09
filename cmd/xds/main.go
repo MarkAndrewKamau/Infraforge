@@ -25,6 +25,7 @@ import (
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 
+	"github.com/MarkAndrewKamau/infraforge/internal/brokerclient"
 	xdspkg "github.com/MarkAndrewKamau/infraforge/internal/xds"
 
 	"google.golang.org/grpc"
@@ -43,6 +44,15 @@ func main() {
 		log.Error("initial snapshot push failed", "err", err)
 		os.Exit(1)
 	}
+
+	// Start the reconciler. It treats the broker's job inventory as the
+	// source of truth: on startup it runs once synchronously so Envoy's
+	// first connection sees a snapshot matching reality, and then it
+	// re-runs every XDS_RECONCILE_EVERY to repair any drift from missed
+	// register/unregister events.
+	reconcilerCtx, stopReconciler := context.WithCancel(context.Background())
+	defer stopReconciler()
+	startReconciler(reconcilerCtx, reg, log)
 
 	grpcAddr := envOr("XDS_GRPC_ADDR", ":18000")
 	httpAddr := envOr("XDS_HTTP_ADDR", ":19000")
@@ -80,7 +90,10 @@ func main() {
 	<-ctx.Done()
 
 	log.Info("shutting down")
-	grpcSrv.GracefulStop()
+	// Stop() rather than GracefulStop(): the ADS stream Envoy holds open
+	// never closes from the client side, so GracefulStop would block
+	// indefinitely. Envoy reconnects on the next xds start anyway.
+	grpcSrv.Stop()
 	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shCtx)
@@ -162,6 +175,54 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// startReconciler runs the initial reconcile synchronously (so Envoy's
+// first connection sees the right snapshot), then kicks off the periodic
+// reconcile in a goroutine. The initial pass is given a short timeout
+// so a temporarily unreachable broker does not delay startup more than a
+// few seconds — the periodic loop will catch up.
+func startReconciler(ctx context.Context, reg *xdspkg.Registry, log *slog.Logger) {
+	brokerAddr := envOr("BROKER_ADDR", "localhost:8080")
+	every := envDur("XDS_RECONCILE_EVERY", 60*time.Second, log)
+
+	r := &xdspkg.Reconciler{
+		Broker:   brokerclient.New(brokerAddr),
+		Registry: reg,
+		Log:      log,
+	}
+
+	// Initial reconcile blocks startup but only briefly — broker
+	// unreachable should not prevent xds from coming up at all.
+	initCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := r.Reconcile(initCtx); err != nil {
+		log.Warn("initial reconcile failed; periodic loop will retry",
+			"broker", brokerAddr, "err", err)
+	}
+
+	// Periodic reconcile in the background. r.Run does its own initial
+	// reconcile too, but we already did it above; pass every and let it
+	// loop. (Run's initial-reconcile call is a no-op when state is
+	// already correct.)
+	go r.Run(ctx, every)
+	log.Info("reconciler started", "broker", brokerAddr, "every", every)
+}
+
+// envDur is like envOr but for time.Duration. Unparseable values fall
+// back to the default with a warning.
+func envDur(key string, def time.Duration, log *slog.Logger) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Warn("invalid duration env var, using default",
+			"key", key, "value", v, "default", def)
+		return def
+	}
+	return d
 }
 
 // cacheLog adapts slog to go-control-plane's tiny logger interface
