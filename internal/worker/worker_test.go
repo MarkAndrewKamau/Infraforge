@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"strings"
+
 	"github.com/MarkAndrewKamau/infraforge/internal/model"
 	"github.com/MarkAndrewKamau/infraforge/internal/provisioner"
 	"github.com/MarkAndrewKamau/infraforge/internal/queue"
@@ -29,7 +31,10 @@ func (f *fakeXDS) Unregister(_ context.Context, svc, host string, port int) erro
 	return nil
 }
 
-type fakeQueue struct{ acked []string }
+type fakeQueue struct {
+	acked []string
+	dead  []string
+}
 
 func (f *fakeQueue) Enqueue(context.Context, string, queue.Action) error { return nil }
 func (f *fakeQueue) Dequeue(context.Context, string, time.Duration) (*queue.Message, error) {
@@ -42,6 +47,11 @@ func (f *fakeQueue) Ack(_ context.Context, m *queue.Message) error {
 	f.acked = append(f.acked, m.ID)
 	return nil
 }
+func (f *fakeQueue) DeadLetter(_ context.Context, m *queue.Message, detail string, attempts int) error {
+	f.dead = append(f.dead, fmt.Sprintf("%s|%s|%d", m.ID, detail, attempts))
+	return nil
+}
+func (f *fakeQueue) ListDead(context.Context, int) ([]*queue.DeadEntry, error) { return nil, nil }
 
 type fakeProv struct {
 	result        *provisioner.Result
@@ -124,8 +134,9 @@ func TestHandleProvisionSuccess(t *testing.T) {
 	}
 }
 
-func TestHandleProvisionFailureMarksFailed(t *testing.T) {
+func TestHandleProvisionPermanentFailureMarksFailedAndDeadLetters(t *testing.T) {
 	q := &fakeQueue{}
+	// A plain error (not wrapped with ErrTransient) is permanent.
 	w, st, _ := newTestWorker(&fakeProv{provErr: errors.New("docker exploded")}, q)
 	seed(t, st, &model.Job{ID: "j1", Status: model.StatusPending})
 
@@ -139,7 +150,36 @@ func TestHandleProvisionFailureMarksFailed(t *testing.T) {
 		t.Errorf("want detail set on failure")
 	}
 	if len(q.acked) != 1 {
-		t.Errorf("expected ack on failure")
+		t.Errorf("expected ack on permanent failure")
+	}
+	if len(q.dead) != 1 {
+		t.Errorf("expected one dead-letter entry, got %v", q.dead)
+	}
+}
+
+func TestHandleProvisionTransientErrorDoesNotAck(t *testing.T) {
+	q := &fakeQueue{}
+	// Wrap with ErrTransient so the worker treats it as retryable.
+	transient := fmt.Errorf("%w: %s", provisioner.ErrTransient, "docker daemon down")
+	w, st, _ := newTestWorker(&fakeProv{provErr: transient}, q)
+	seed(t, st, &model.Job{ID: "j1", Status: model.StatusPending})
+
+	w.handle(context.Background(), provMsg("j1"))
+
+	got, _ := st.Get(context.Background(), "j1")
+	// Status stays provisioning so a polling client sees the worker is
+	// still trying. Detail carries the transient note.
+	if got.Status != model.StatusProvisioning {
+		t.Errorf("status = %s, want provisioning (still in progress)", got.Status)
+	}
+	if got.Detail == "" || !strings.Contains(got.Detail, "transient") {
+		t.Errorf("detail = %q, want transient marker", got.Detail)
+	}
+	if len(q.acked) != 0 {
+		t.Errorf("transient error should NOT ack; got acked=%v", q.acked)
+	}
+	if len(q.dead) != 0 {
+		t.Errorf("transient error should NOT dead-letter; got dead=%v", q.dead)
 	}
 }
 
@@ -196,6 +236,9 @@ func TestHandleProvisionAbandonsAfterMaxAttempts(t *testing.T) {
 	}
 	if len(q.acked) != 1 {
 		t.Errorf("expected ack when abandoning a poison job")
+	}
+	if len(q.dead) != 1 {
+		t.Errorf("expected dead-letter entry on abandonment, got %v", q.dead)
 	}
 }
 
