@@ -11,6 +11,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -177,17 +178,22 @@ func (w *Worker) provision(ctx context.Context, log *slog.Logger, msg *queue.Mes
 		return
 	}
 
-	// Poison-message guard. A job that keeps crashing its worker would
-	// otherwise be reclaimed and retried forever. Attempts is persisted
-	// on the job, so the count survives the crash that incremented it.
+	// Poison-message guard. A job that keeps crashing its worker (or that
+	// keeps returning a transient error) would otherwise be reclaimed and
+	// retried forever. Attempts is persisted on the job so the count
+	// survives the crash that incremented it.
 	job.Attempts++
 	if job.Attempts > w.MaxAttempts {
 		log.Error("abandoning job: too many attempts", "attempts", job.Attempts-1)
 		job.Status = model.StatusFailed
-		job.Detail = fmt.Sprintf("provisioning abandoned after %d attempts", job.Attempts-1)
+		detail := fmt.Sprintf("abandoned after %d attempts", job.Attempts-1)
+		job.Detail = detail
 		job.UpdatedAt = now()
 		_ = w.Store.Put(ctx, job)
 		_ = w.Queue.Ack(ctx, msg)
+		if err := w.Queue.DeadLetter(ctx, msg, detail, job.Attempts-1); err != nil {
+			log.Warn("dead-letter write failed", "err", err)
+		}
 		return
 	}
 
@@ -198,16 +204,31 @@ func (w *Worker) provision(ctx context.Context, log *slog.Logger, msg *queue.Mes
 
 	res, err := w.Provision.Provision(ctx, job)
 	if err != nil {
-		log.Error("provision failed", "err", err)
+		if errors.Is(err, provisioner.ErrTransient) {
+			// Transient failures (Docker daemon hiccup, network blip,
+			// etc.) may succeed on retry. Do not ack — the message stays
+			// in this consumer's PEL and the reclaim loop will hand it
+			// back after ReclaimMinIdle. The attempts cap above still
+			// applies, so we cannot loop forever.
+			log.Warn("transient provision error; not acking, will be reclaimed",
+				"attempts", job.Attempts, "err", err)
+			job.Detail = "transient: " + err.Error()
+			job.UpdatedAt = now()
+			_ = w.Store.Put(ctx, job)
+			return
+		}
+		// Permanent: bad config, missing image, etc. Retrying would just
+		// produce the same error, so we mark failed, ack, and write to
+		// the dead-letter stream so an operator can find the post-mortem.
+		log.Error("permanent provision failure", "err", err)
 		job.Status = model.StatusFailed
 		job.Detail = err.Error()
 		job.UpdatedAt = now()
 		_ = w.Store.Put(ctx, job)
-		// A returned error is a definite, observed failure (bad config,
-		// missing image). Retrying it would just fail the same way, so
-		// we ack. Only *crashes* — where the worker dies and no error is
-		// ever returned — are retried, via the reclaim loop.
 		_ = w.Queue.Ack(ctx, msg)
+		if dlErr := w.Queue.DeadLetter(ctx, msg, job.Detail, job.Attempts); dlErr != nil {
+			log.Warn("dead-letter write failed", "err", dlErr)
+		}
 		return
 	}
 
