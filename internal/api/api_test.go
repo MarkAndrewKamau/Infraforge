@@ -41,6 +41,16 @@ func (f *fakeQueue) Reclaim(context.Context, string, time.Duration, int) ([]*que
 	return nil, nil
 }
 func (f *fakeQueue) Ack(context.Context, *queue.Message) error { return nil }
+func (f *fakeQueue) DeadLetter(context.Context, *queue.Message, string, int) error {
+	return nil
+}
+
+// deadEntries lets a test pre-load what ListDead returns.
+var deadEntries []*queue.DeadEntry
+
+func (f *fakeQueue) ListDead(context.Context, int) ([]*queue.DeadEntry, error) {
+	return deadEntries, nil
+}
 
 func newTestServer(q queue.Queue) (*Server, store.Store) {
 	st := store.NewMem()
@@ -161,6 +171,35 @@ func TestDeprovisionUnknownReturns404(t *testing.T) {
 	rec := do(srv, http.MethodDelete, "/v1/provision/ghost", "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestListDeadReturnsEntries(t *testing.T) {
+	// Pre-load what the fake ListDead returns.
+	now := time.Now().UTC()
+	deadEntries = []*queue.DeadEntry{
+		{StreamID: "s1-0", JobID: "j1", Action: queue.ActionProvision,
+			Detail: "image missing", Attempts: 1, Timestamp: now},
+	}
+	t.Cleanup(func() { deadEntries = nil })
+
+	srv, _ := newTestServer(&fakeQueue{})
+	rec := do(srv, http.MethodGet, "/v1/dead", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Count   int                `json:"count"`
+		Entries []queue.DeadEntry  `json:"entries"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Count != 1 || len(resp.Entries) != 1 {
+		t.Fatalf("count = %d entries = %v, want 1", resp.Count, resp.Entries)
+	}
+	if resp.Entries[0].JobID != "j1" || resp.Entries[0].Detail != "image missing" {
+		t.Errorf("entry = %+v, want j1 + image missing", resp.Entries[0])
 	}
 }
 
