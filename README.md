@@ -450,6 +450,33 @@ Error responses:
 | 404 | No job recorded for the given identifier. |
 | 500 | State store unreachable. |
 
+### `GET /v1/dead`
+
+Return recent dead-letter entries — the post-mortem log of jobs the
+worker abandoned. Supports `?limit=N` (default 100, max 1000).
+
+Response `200 OK`:
+```json
+{
+  "count": 1,
+  "entries": [
+    {
+      "stream_id": "1781512011750-0",
+      "job_id":    "683b03bcd30e1588",
+      "action":    "provision",
+      "detail":    "http: image infraforge/echo:dev not present locally; ...",
+      "attempts":  1,
+      "timestamp": "2026-06-15T08:26:51.75006183Z"
+    }
+  ]
+}
+```
+
+A job ends up here when the provisioner returns a permanent error or
+the attempts cap is exceeded. Transient failures (Docker daemon
+unreachable, network blip) are retried via the reclaim loop and only
+arrive here if they exhaust the cap.
+
 ### `DELETE /v1/provision/{id}`
 
 Begin teardown of a job's resources. Like provisioning, this is
@@ -500,6 +527,24 @@ the status checks in the worker), reprocessing a half-finished job
 converges on a single resource. A persisted `attempts` counter caps how
 many times a poison job may be retried before it is abandoned as
 `failed`.
+
+**Retryable-error classification.** A returned provisioner error is
+either transient or permanent. Transient errors (Docker daemon
+unreachable, network blip, i/o timeout) are wrapped with
+`provisioner.ErrTransient` by a string-matching classifier; the worker
+sees the wrap, does **not** ack, and lets the reclaim loop hand the
+message back after `ReclaimMinIdle`. The attempts cap still applies, so
+a permanently transient cause does not loop forever. Permanent errors
+(missing image, bad mount, port collision) are acked immediately —
+retrying them would just fail the same way.
+
+**Dead-letter on abandonment.** Whenever the worker abandons a job —
+permanent error on first try, or attempts cap exceeded — it `XADD`s a
+record onto `infraforge:jobs:dead` carrying the job ID, action, last
+error, attempts count and timestamp. The main stream stays clean, the
+audit log is preserved. `GET /v1/dead` exposes it for inspection. The
+dead-letter stream is `MAXLEN`-capped (~1000) so a long-running learning
+system does not grow unbounded.
 
 **Persist before ack.** The worker writes the terminal job state to the
 store before issuing `XACK`. If the ack fails, redelivery will hit the
@@ -687,6 +732,8 @@ docker volume rm infraforge_redis-data                  # wipe persistent Redis 
 | Live L7 routing: `localhost:10000/<service>/...` to the HTTP companion | Implemented |
 | Round-robin load balancing across multiple provisions of one service | Implemented |
 | xDS reconciler: pulls the broker job inventory at startup and periodically, healing drift after an xds restart or a missed register event | Implemented |
+| Retryable-error classification (`provisioner.ErrTransient`): transient failures retried via reclaim, permanent failures fail fast | Implemented |
+| Dead-letter stream + `GET /v1/dead`: abandoned jobs preserved on a parallel stream with cause and attempts count, exposed for inspection | Implemented |
 | Continuous integration (vet, build, race-enabled tests) | Implemented |
 
 ## Planned Work
@@ -709,20 +756,6 @@ internal-PaaS pattern it is modeled on, and lets the system be exercised
 with realistic primitives (namespaces, RBAC, Secrets, Services) rather
 than Docker labels and host ports.
 
-### Dead-letter stream and retryable-error classification
-
-Two refinements to the failure handling already in place:
-
-- **Dead-letter stream.** A job abandoned after exhausting its retry cap
-  is currently just marked `failed`. Moving its stream entry onto a
-  second stream (`infraforge:jobs:dead`) carrying the last error would
-  preserve it for inspection and keep the main stream clean.
-- **Retryable-error classification.** Today a returned provisioning
-  error is treated as terminal and acked immediately; only outright
-  worker crashes are retried via reclaim. Classifying transient failures
-  (a Docker daemon hiccup) as retryable, versus permanent ones (bad
-  config), would let the reclaim machinery retry the cases that can
-  actually succeed.
 
 ### Observability
 
