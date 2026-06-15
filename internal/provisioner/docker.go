@@ -50,11 +50,11 @@ func NewShell(log *slog.Logger) *Shell {
 func (p *Shell) Provision(ctx context.Context, j *model.Job) (*Result, error) {
 	conn, err := p.provisionPostgres(ctx, j)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: %w", err)
+		return nil, Classify(fmt.Errorf("postgres: %w", err))
 	}
 	httpEP, err := p.provisionHTTP(ctx, j)
 	if err != nil {
-		return nil, fmt.Errorf("http: %w", err)
+		return nil, Classify(fmt.Errorf("http: %w", err))
 	}
 	return &Result{Connection: conn, HTTP: httpEP}, nil
 }
