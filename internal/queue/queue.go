@@ -20,6 +20,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -31,6 +32,14 @@ const (
 	StreamKey = "infraforge:jobs"
 	// Group is the consumer group the worker(s) read under.
 	Group = "provisioners"
+	// DeadStreamKey is the parallel stream where abandoned jobs land for
+	// post-mortem inspection. It is intentionally not consumed by anyone;
+	// it is an audit log.
+	DeadStreamKey = "infraforge:jobs:dead"
+	// deadStreamMaxLen caps the dead-letter stream so a long-running
+	// learning system does not accumulate entries forever. Approximate
+	// trimming so the actual length may slightly exceed this.
+	deadStreamMaxLen = 1000
 )
 
 // Action is what the worker should do with a job.
@@ -62,6 +71,23 @@ type Queue interface {
 	Reclaim(ctx context.Context, consumer string, minIdle time.Duration, count int) ([]*Message, error)
 	// Ack removes a message from the group's pending list.
 	Ack(ctx context.Context, m *Message) error
+	// DeadLetter writes an entry to the dead-letter stream describing an
+	// abandoned job. The caller is responsible for the corresponding Ack
+	// on the main stream — DeadLetter only writes the audit record.
+	DeadLetter(ctx context.Context, m *Message, detail string, attempts int) error
+	// ListDead returns up to limit recent dead-letter entries, oldest
+	// first. limit <= 0 means a sensible default.
+	ListDead(ctx context.Context, limit int) ([]*DeadEntry, error)
+}
+
+// DeadEntry is one record in the dead-letter stream.
+type DeadEntry struct {
+	StreamID  string    `json:"stream_id"`
+	JobID     string    `json:"job_id"`
+	Action    Action    `json:"action"`
+	Detail    string    `json:"detail"`
+	Attempts  int       `json:"attempts"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 type RedisQueue struct{ rdb *redis.Client }
@@ -129,6 +155,58 @@ func (q *RedisQueue) Reclaim(ctx context.Context, consumer string, minIdle time.
 
 func (q *RedisQueue) Ack(ctx context.Context, m *Message) error {
 	return q.rdb.XAck(ctx, StreamKey, Group, m.ID).Err()
+}
+
+func (q *RedisQueue) DeadLetter(ctx context.Context, m *Message, detail string, attempts int) error {
+	return q.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: DeadStreamKey,
+		MaxLen: deadStreamMaxLen,
+		Approx: true, // Approximate trimming is faster and good enough for an audit log.
+		Values: map[string]any{
+			"job_id":    m.JobID,
+			"action":    string(m.Action),
+			"detail":    detail,
+			"attempts":  attempts,
+			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		},
+	}).Err()
+}
+
+func (q *RedisQueue) ListDead(ctx context.Context, limit int) ([]*DeadEntry, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	res, err := q.rdb.XRangeN(ctx, DeadStreamKey, "-", "+", int64(limit)).Result()
+	if err != nil {
+		// A missing stream (no XADDs ever made it) is just an empty list.
+		if errors.Is(err, redis.Nil) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]*DeadEntry, 0, len(res))
+	for _, m := range res {
+		e := &DeadEntry{StreamID: m.ID}
+		if v, ok := m.Values["job_id"].(string); ok {
+			e.JobID = v
+		}
+		if v, ok := m.Values["action"].(string); ok {
+			e.Action = Action(v)
+		}
+		if v, ok := m.Values["detail"].(string); ok {
+			e.Detail = v
+		}
+		if v, ok := m.Values["attempts"].(string); ok {
+			_, _ = fmt.Sscanf(v, "%d", &e.Attempts)
+		}
+		if v, ok := m.Values["timestamp"].(string); ok {
+			if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+				e.Timestamp = t
+			}
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // messageFrom decodes a raw stream entry. A missing action field is

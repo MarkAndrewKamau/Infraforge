@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/MarkAndrewKamau/infraforge/internal/model"
@@ -39,6 +40,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/provision", s.handleProvision)
 	mux.HandleFunc("GET /v1/provision/{id}", s.handleStatus)
 	mux.HandleFunc("DELETE /v1/provision/{id}", s.handleDeprovision)
+	mux.HandleFunc("GET /v1/dead", s.handleListDead)
 	return mux
 }
 
@@ -176,6 +178,28 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("deprovision requested", "id", id, "service", job.ServiceName)
 	writeJSON(w, http.StatusAccepted, job)
+}
+
+// handleListDead returns recent entries from the dead-letter stream —
+// the post-mortem log of jobs the worker abandoned (permanent failures
+// or exhausted retries). Supports ?limit=N (default 100, max 1000).
+func (s *Server) handleListDead(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	entries, err := s.queue.ListDead(r.Context(), limit)
+	if err != nil {
+		s.log.Error("list dead-letter failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "could not list dead-letter")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":   len(entries),
+		"entries": entries,
+	})
 }
 
 // newID is a short random hex ID — enough for a local learning system.
